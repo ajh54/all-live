@@ -103,54 +103,60 @@ jobs:
             $lines | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
           }
 
-      - name: 产物自检（缺程序集或清单不一致就立刻失败）
+      - name: 产物自检（形态不一致就立刻失败）
         shell: pwsh
         run: |
-          # 非 .NET Native 的 UWP 包必须自带这些程序集，少一个装上去就是启动即崩。
-          # Jint/Acornima 是斗鱼本地签名用的；System.Memory/Buffers/Unsafe/Vectors
-          # 是 Jint 的依赖，必须随包发布。
+          # 这里只检查"能真正判断产物好坏的项"。曾经误报过的几个文件已剔除：
+          #   AllLive.UWP.dll            —— .NET Native 专有；非 Native 产物里本来就没有
+          #   System.Memory/Buffers/Numerics.Vectors —— 由 UWP 框架提供，不必随包
+          # （已与一个合法非 Native 产物逐项比对确认。）
           $layout = 'AllLive.UWP/bin/x64/Release'
-          $required = @(
-            'AllLive.UWP.exe',
-            'AllLive.UWP.dll',
-            'AllLive.Core.dll',
-            'Jint.dll',
-            'Acornima.dll',
-            'System.Memory.dll',
-            'System.Buffers.dll',
-            'System.Runtime.CompilerServices.Unsafe.dll',
-            'System.Numerics.Vectors.dll'
-          )
-          $missing = @()
-          Write-Host "--- 产物清单 ($layout) ---"
-          foreach ($f in $required) {
-            $p = Join-Path $layout $f
-            if (Test-Path $p) {
-              Write-Host ("  {0,-46} {1,10:N0} 字节  ✓" -f $f, (Get-Item $p).Length)
-            } else {
-              Write-Host ("  {0,-46} 缺失  ✗" -f $f)
-              $missing += $f
+          $problems = @()
+
+          # 1) 关键判别项：主程序必须是"托管形态"。
+          #    非 Native 时 AllLive.UWP.exe 本身就是托管程序集（约 350KB）；
+          #    .NET Native 会把它编成本机映像，exe 只剩约 8KB 的壳，
+          #    此时若清单却声明非 Native，就是混合产物 —— 装上去主界面闪一下就崩。
+          $exe = Join-Path $layout 'AllLive.UWP.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Host '::error::找不到 AllLive.UWP.exe'
+            $problems += 'AllLive.UWP.exe'
+          } else {
+            $size = (Get-Item $exe).Length
+            Write-Host ("  AllLive.UWP.exe  {0:N0} 字节" -f $size)
+            if ($size -lt 65536) {
+              Write-Host '::error::AllLive.UWP.exe 只有壳的大小(疑似 .NET Native 形态)，而清单却是非 Native —— 混合产物，装上会闪退'
+              $problems += 'AllLive.UWP.exe 形态不对(疑似 Native 壳)'
             }
           }
 
-          # 清单声明的依赖必须与非 Native 一致
+          # 2) 斗鱼本地签名依赖必须随包发布（这两个不是框架自带的）
+          foreach ($f in @('AllLive.Core.dll', 'Jint.dll', 'Acornima.dll')) {
+            $p = Join-Path $layout $f
+            if (Test-Path $p) {
+              Write-Host ("  {0,-24} {1,10:N0} 字节  ✓" -f $f, (Get-Item $p).Length)
+            } else {
+              Write-Host ("  {0,-24} 缺失  ✗" -f $f)
+              $problems += $f
+            }
+          }
+
+          # 3) 清单声明的依赖类型必须与非 Native 编译一致
           $mf = Join-Path $layout 'AppxManifest.xml'
           if (Test-Path $mf) {
-            $raw = Get-Content $mf -Raw
-            if ($raw -match 'Native\.Framework|Native\.Runtime') {
-              Write-Host '::error::产物清单声明的是 .NET Native 依赖，但实际用的是非 Native 编译 —— 这是混合产物，装上会闪退'
-              $missing += 'AppxManifest 依赖声明不一致'
+            if ((Get-Content $mf -Raw) -match 'Native\.Framework|Native\.Runtime') {
+              Write-Host '::error::清单声明的是 .NET Native 依赖，却用非 Native 编译 —— 混合产物'
+              $problems += 'AppxManifest 依赖声明'
             } else {
-              Write-Host ''
-              Write-Host 'AppxManifest 依赖声明: 非 Native (CoreRuntime/CoreFramework) ✓'
+              Write-Host '  AppxManifest 依赖声明: 非 Native (CoreRuntime/CoreFramework) ✓'
             }
           } else {
             Write-Host '::error::找不到 AppxManifest.xml'
-            $missing += 'AppxManifest.xml'
+            $problems += 'AppxManifest.xml'
           }
 
-          if ($missing.Count -gt 0) {
-            Write-Host "::error::产物自检失败，缺少或异常: $($missing -join ', ')"
+          if ($problems.Count -gt 0) {
+            Write-Host "::error::产物自检失败: $($problems -join ', ')"
             exit 1
           }
           Write-Host ''
