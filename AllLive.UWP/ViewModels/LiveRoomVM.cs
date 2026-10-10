@@ -410,6 +410,44 @@ namespace AllLive.UWP.ViewModels
 
         }
 
+        /// <summary>
+        /// 重新获取当前线路的播放直链（斗鱼直链有 300 秒会话上限，到点必须换新链接），
+        /// 成功返回新地址，失败返回 null。
+        /// </summary>
+        public async Task<string> RefreshCurrentLineUrlAsync()
+        {
+            if (Site == null || detail == null || CurrentQuality == null || CurrentLine == null || Lines == null)
+            {
+                return null;
+            }
+            try
+            {
+                var index = Lines.IndexOf(CurrentLine);
+                if (index < 0)
+                {
+                    return null;
+                }
+                var data = await Site.GetPlayUrls(detail, CurrentQuality);
+                if (data == null || data.Count == 0)
+                {
+                    return null;
+                }
+                // 服务端返回的线路顺序是稳定的，优先复用同一序号，越界时回退到第一条
+                var url = index < data.Count ? data[index] : data[0];
+                if (string.IsNullOrEmpty(url))
+                {
+                    return null;
+                }
+                Lines[index].Url = url;
+                return url;
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Log("刷新播放地址失败", LogType.ERROR, ex);
+                return null;
+            }
+        }
+
         public async void LoadSuperChat()
         {
             try
@@ -439,7 +477,7 @@ namespace AllLive.UWP.ViewModels
                 {
                     Type = LiveMessageType.Chat,
                     UserName = "系统",
-                    Message = "连接已经关闭"
+                    Message = string.IsNullOrEmpty(e) ? "连接已经关闭" : e
                 });
             });
         }

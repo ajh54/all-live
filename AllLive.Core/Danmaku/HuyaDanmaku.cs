@@ -39,7 +39,15 @@ namespace AllLive.Core.Danmaku
     }
     public class HuyaDanmaku : ILiveDanmaku
     {
-        public int HeartbeatTime => 60 * 1000;
+        // 虎牙服务端 60 秒收不到心跳就直接断开（实测 close code 1006）。
+        // 间隔必须明显小于这条死线：按 60 秒发的话，心跳会因为定时器精度、
+        // 调度延迟和网络 RTT 而卡在死线上晚到几毫秒，连接每次都会被踢掉。
+        public int HeartbeatTime => 30 * 1000;
+
+        /// <summary>重连退避的起始间隔/秒</summary>
+        private const int ReconnectBaseDelay = 2;
+        /// <summary>重连退避的最大间隔/秒</summary>
+        private const int ReconnectMaxDelay = 30;
 
         public event EventHandler<LiveMessage> NewMessage;
         public event EventHandler<string> OnClose;
@@ -48,17 +56,27 @@ namespace AllLive.Core.Danmaku
         Timer timer;
         WebSocket ws;
         HuyaDanmakuArgs args;
+        private readonly object reconnectLock = new object();
+        private volatile bool stopped;
+        private bool reconnecting;
+        private int retryCount;
         public HuyaDanmaku()
         {
             heartBeatData = Convert.FromBase64String("ABQdAAwsNgBM");
-            ws = new WebSocket(ServerUrl);
-            ws.OnOpen += Ws_OnOpen;
-            ws.OnError += Ws_OnError;
-            ws.OnMessage += Ws_OnMessage;
-            ws.OnClose += Ws_OnClose;
+            ws = CreateSocket();
             timer = new Timer(HeartbeatTime);
             timer.Elapsed += Timer_Elapsed;
 
+        }
+
+        private WebSocket CreateSocket()
+        {
+            var socket = new WebSocket(ServerUrl);
+            socket.OnOpen += Ws_OnOpen;
+            socket.OnError += Ws_OnError;
+            socket.OnMessage += Ws_OnMessage;
+            socket.OnClose += Ws_OnClose;
+            return socket;
         }
         private async void Ws_OnOpen(object sender, EventArgs e)
         {
@@ -157,12 +175,93 @@ namespace AllLive.Core.Danmaku
 
         private void Ws_OnClose(object sender, CloseEventArgs e)
         {
-            OnClose?.Invoke(this, e.Reason);
+            // 忽略已经被替换掉的旧连接（重连过程中它会触发一次关闭事件）
+            if (stopped || !ReferenceEquals(sender, ws))
+            {
+                return;
+            }
+            OnClose?.Invoke(this, string.IsNullOrEmpty(e.Reason) ? "连接已经关闭" : $"连接已经关闭：{e.Reason}");
+            _ = Reconnect();
         }
 
         private void Ws_OnError(object sender, WebSocketSharp.ErrorEventArgs e)
         {
-            OnClose?.Invoke(this, e.Message);
+            if (stopped || !ReferenceEquals(sender, ws))
+            {
+                return;
+            }
+            OnClose?.Invoke(this, "连接出错：" + e.Message);
+            _ = Reconnect();
+        }
+
+        /// <summary>
+        /// 断线自动重连：停掉心跳 -> 退避等待 -> 换新连接重连。
+        /// 连上后 Ws_OnOpen 会重新发送进房信息并重启心跳。
+        /// </summary>
+        private async Task Reconnect()
+        {
+            if (stopped || !BeginReconnect())
+            {
+                return;
+            }
+            try
+            {
+                while (!stopped)
+                {
+                    timer.Stop();
+                    var delay = Math.Min(ReconnectMaxDelay, ReconnectBaseDelay * ++retryCount);
+                    OnClose?.Invoke(this, $"连接已断开，{delay} 秒后自动重连");
+                    await Task.Delay(delay * 1000).ConfigureAwait(false);
+                    if (stopped)
+                    {
+                        return;
+                    }
+                    try
+                    {
+                        var old = ws;
+                        ws = CreateSocket();
+                        try
+                        {
+                            old?.Close();
+                        }
+                        catch (Exception)
+                        {
+                        }
+                        await Task.Run(() => ws.Connect()).ConfigureAwait(false);
+                        retryCount = 0;
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        OnClose?.Invoke(this, "重连失败：" + ex.Message);
+                    }
+                }
+            }
+            finally
+            {
+                EndReconnect();
+            }
+        }
+
+        private bool BeginReconnect()
+        {
+            lock (reconnectLock)
+            {
+                if (reconnecting)
+                {
+                    return false;
+                }
+                reconnecting = true;
+                return true;
+            }
+        }
+
+        private void EndReconnect()
+        {
+            lock (reconnectLock)
+            {
+                reconnecting = false;
+            }
         }
 
         private void Timer_Elapsed(object sender, ElapsedEventArgs e)
@@ -172,15 +271,27 @@ namespace AllLive.Core.Danmaku
 
         public async void Heartbeat()
         {
+            if (stopped)
+            {
+                return;
+            }
             await Task.Run(() =>
             {
-                ws.Send(heartBeatData);
+                try
+                {
+                    ws.Send(heartBeatData);
+                }
+                catch (Exception)
+                {
+                }
             });
         }
 
         public async Task Start(object args)
         {
             this.args = (HuyaDanmakuArgs)args;
+            stopped = false;
+            retryCount = 0;
             await Task.Run(() =>
             {
                 ws.Connect();
@@ -189,10 +300,17 @@ namespace AllLive.Core.Danmaku
 
         public async Task Stop()
         {
+            stopped = true;
             timer.Stop();
             await Task.Run(() =>
             {
-                ws.Close();
+                try
+                {
+                    ws.Close();
+                }
+                catch (Exception)
+                {
+                }
             });
         }
 

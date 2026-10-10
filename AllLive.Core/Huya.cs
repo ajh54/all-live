@@ -157,10 +157,14 @@ namespace AllLive.Core
             {
                 if (!string.IsNullOrEmpty(item["sFlvUrl"]?.ToString()))
                 {
+                    var flvUrl = item["sFlvUrl"].ToString();
                     huyaLines.Add(new HuyaLineModel()
                     {
-                        Line = item["sFlvUrl"].ToString(),
+                        Line = flvUrl,
                         LineType = HuyaLineType.FLV,
+                        // 必须带上 cdn_type，否则 getCdnTokenInfo 只会签发默认 CDN 的
+                        // token，换到别的线路（尤其 al）播放就会 403
+                        CdnType = GetCdnType(flvUrl),
                         FlvAntiCode = item["sFlvAntiCode"].ToString(),
                         HlsAntiCode = item["sHlsAntiCode"].ToString(),
                         StreamName = item["sStreamName"].ToString(),
@@ -385,6 +389,21 @@ namespace AllLive.Core
 
             return Task.FromResult(qualities);
         }
+        /// <summary>
+        /// 从线路地址推断 CDN 类型（tx / al / bd / hw ...）。
+        /// getCdnTokenInfo 依赖它签发与线路匹配的 token；传空值时只会拿到
+        /// 默认 CDN 的 token，换到别的线路播放就会 403。
+        /// </summary>
+        private static string GetCdnType(string flvUrl)
+        {
+            if (string.IsNullOrEmpty(flvUrl))
+            {
+                return "";
+            }
+            var match = Regex.Match(flvUrl, @"//([a-zA-Z0-9\-]+)\.flv\.huya\.com");
+            return match.Success ? match.Groups[1].Value : "";
+        }
+
         public string ProcessAnticode(string anticode, string uid, string streamname)
         {
             // https://github.com/iceking2nd/real-url/blob/master/huya.py

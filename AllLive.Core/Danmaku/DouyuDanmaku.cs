@@ -26,7 +26,15 @@ namespace AllLive.Core.Danmaku
 {
     public class DouyuDanmaku : ILiveDanmaku
     {
+        // 斗鱼官方《弹幕服务器第三方接入协议》要求 45 秒内发一次心跳。
+        // 实测服务端容忍度远高于此（完全不发心跳也能活过 90 秒），所以斗鱼断连
+        // 不是心跳问题，这里保持官方值即可；真正的改进是下面「响应 pingreq」。
         public int HeartbeatTime => 45 * 1000;
+
+        /// <summary>重连退避的起始间隔/秒</summary>
+        private const int ReconnectBaseDelay = 2;
+        /// <summary>重连退避的最大间隔/秒</summary>
+        private const int ReconnectMaxDelay = 30;
 
         public event EventHandler<LiveMessage> NewMessage;
         public event EventHandler<string> OnClose;
@@ -34,16 +42,26 @@ namespace AllLive.Core.Danmaku
         Timer timer;
         WebSocket ws;
         string roomId;
+        private readonly object reconnectLock = new object();
+        private volatile bool stopped;
+        private bool reconnecting;
+        private int retryCount;
         public DouyuDanmaku()
         {
-            ws = new WebSocket(ServerUrl);
-            ws.OnOpen += Ws_OnOpen;
-            ws.OnError += Ws_OnError;
-            ws.OnMessage += Ws_OnMessage;
-            ws.OnClose += Ws_OnClose;
+            ws = CreateSocket();
             timer = new Timer(HeartbeatTime);
             timer.Elapsed += Timer_Elapsed;
 
+        }
+
+        private WebSocket CreateSocket()
+        {
+            var socket = new WebSocket(ServerUrl);
+            socket.OnOpen += Ws_OnOpen;
+            socket.OnError += Ws_OnError;
+            socket.OnMessage += Ws_OnMessage;
+            socket.OnClose += Ws_OnClose;
+            return socket;
         }
         private async void Ws_OnOpen(object sender, EventArgs e)
         {
@@ -58,36 +76,40 @@ namespace AllLive.Core.Danmaku
         }
         private void Ws_OnMessage(object sender, MessageEventArgs e)
         {
-            try
+            // 一帧里可能粘着多个 STT 包（实测最多 16 个），必须逐个解析；
+            // 原来只读第一个包就返回，一帧里其余的弹幕会被全部丢掉。
+            foreach (var result in DeserializeDouyuAll(e.RawData))
             {
-                string result = DeserializeDouyu(e.RawData);
-                if (result.Length != 0)
+                try
                 {
                     var json = SttToJObject(result);
                     var type = json["type"]?.ToString();
-                    //斗鱼好像不会返回人气值
-                    //有些直播间存在阴间弹幕，不知道什么情况
-                    if (type == "chatmsg")
+                    switch (type)
                     {
-                        // 屏蔽机器人弹幕
-                        if (json["dms"] == null)
-                        {
-                            return;
-                        }
-
-                        NewMessage?.Invoke(this, new LiveMessage()
-                        {
-                            UserName = json["nn"].ToString(),
-                            Message = json["txt"].ToString(),
-                            Color= GetColor(json["col"].ToInt32())
-                        });
+                        // 服务端下发的 pingreq：需要回一次心跳，否则可能被判超时
+                        case "pingreq":
+                            Heartbeat();
+                            break;
+                        //斗鱼好像不会返回人气值
+                        //有些直播间存在阴间弹幕，不知道什么情况
+                        case "chatmsg":
+                            // 屏蔽机器人弹幕
+                            if (json["dms"] == null)
+                            {
+                                break;
+                            }
+                            NewMessage?.Invoke(this, new LiveMessage()
+                            {
+                                UserName = json["nn"].ToString(),
+                                Message = json["txt"].ToString(),
+                                Color = GetColor(json["col"].ToInt32())
+                            });
+                            break;
                     }
-
                 }
-
-            }
-            catch (Exception)
-            {
+                catch (Exception)
+                {
+                }
             }
         }
 
@@ -114,15 +136,94 @@ namespace AllLive.Core.Danmaku
 
         private void Ws_OnClose(object sender, CloseEventArgs e)
         {
-            OnClose?.Invoke(this, e.Reason);
+            // 忽略已经被替换掉的旧连接（重连过程中它会触发一次关闭事件）
+            if (stopped || !ReferenceEquals(sender, ws))
+            {
+                return;
+            }
+            OnClose?.Invoke(this, string.IsNullOrEmpty(e.Reason) ? "连接已经关闭" : $"连接已经关闭：{e.Reason}");
+            _ = Reconnect();
         }
 
         private void Ws_OnError(object sender, WebSocketSharp.ErrorEventArgs e)
         {
-            OnClose?.Invoke(this, e.Message);
+            if (stopped || !ReferenceEquals(sender, ws))
+            {
+                return;
+            }
+            OnClose?.Invoke(this, "连接出错：" + e.Message);
+            _ = Reconnect();
         }
 
+        /// <summary>
+        /// 断线自动重连：停掉心跳 -> 退避等待 -> 换新连接重连。
+        /// 连上后 Ws_OnOpen 会重新发送 loginreq/joingroup 并重启心跳。
+        /// </summary>
+        private async Task Reconnect()
+        {
+            if (stopped || !BeginReconnect())
+            {
+                return;
+            }
+            try
+            {
+                while (!stopped)
+                {
+                    timer.Stop();
+                    var delay = Math.Min(ReconnectMaxDelay, ReconnectBaseDelay * ++retryCount);
+                    OnClose?.Invoke(this, $"连接已断开，{delay} 秒后自动重连");
+                    await Task.Delay(delay * 1000).ConfigureAwait(false);
+                    if (stopped)
+                    {
+                        return;
+                    }
+                    try
+                    {
+                        var old = ws;
+                        ws = CreateSocket();
+                        try
+                        {
+                            old?.Close();
+                        }
+                        catch (Exception)
+                        {
+                        }
+                        await Task.Run(() => ws.Connect()).ConfigureAwait(false);
+                        retryCount = 0;
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        OnClose?.Invoke(this, "重连失败：" + ex.Message);
+                    }
+                }
+            }
+            finally
+            {
+                EndReconnect();
+            }
+        }
 
+        private bool BeginReconnect()
+        {
+            lock (reconnectLock)
+            {
+                if (reconnecting)
+                {
+                    return false;
+                }
+                reconnecting = true;
+                return true;
+            }
+        }
+
+        private void EndReconnect()
+        {
+            lock (reconnectLock)
+            {
+                reconnecting = false;
+            }
+        }
 
         private void Timer_Elapsed(object sender, ElapsedEventArgs e)
         {
@@ -131,15 +232,27 @@ namespace AllLive.Core.Danmaku
 
         public async void Heartbeat()
         {
+            if (stopped)
+            {
+                return;
+            }
             await Task.Run(() =>
             {
-                ws.Send(SerializeDouyu($"type@=mrkl/"));
+                try
+                {
+                    ws.Send(SerializeDouyu($"type@=mrkl/"));
+                }
+                catch (Exception)
+                {
+                }
             });
         }
 
         public async Task Start(object args)
         {
             this.roomId = args.ToString();
+            stopped = false;
+            retryCount = 0;
             await Task.Run(() =>
             {
                 ws.Connect();
@@ -148,10 +261,17 @@ namespace AllLive.Core.Danmaku
 
         public async Task Stop()
         {
+            stopped = true;
             timer.Stop();
             await Task.Run(() =>
             {
-                ws.Close();
+                try
+                {
+                    ws.Close();
+                }
+                catch (Exception)
+                {
+                }
             });
         }
 
@@ -166,8 +286,11 @@ namespace AllLive.Core.Danmaku
             {
                 using (var writer = new BinaryWriter(ms))
                 {
-                    writer.Write(4 + 4 + body.Length + 1);
-                    writer.Write(4 + 4 + body.Length + 1);
+                    // 长度字段必须是 UTF-8 字节数：body.Length 是字符数，
+                    // 遇到非 ASCII 内容（中文等）会算错导致服务端解析失败
+                    var packetLength = 4 + 4 + bodyBuffer.Length + 1;
+                    writer.Write(packetLength);
+                    writer.Write(packetLength);
                     writer.Write(ClientSendToServer);
                     writer.Write(Encrypted);
                     writer.Write(Reserved);
@@ -183,34 +306,35 @@ namespace AllLive.Core.Danmaku
 
         }
 
-        private string DeserializeDouyu(byte[] bytes)
+        /// <summary>
+        /// 解析一帧数据里的全部 STT 包。
+        /// 斗鱼服务端会把多个包粘在一个 WebSocket 帧里（实测最多 16 个），
+        /// 必须按包头里的长度循环剥离，不能只读第一个。
+        /// </summary>
+        private List<string> DeserializeDouyuAll(byte[] bytes)
         {
-
-            try
+            var result = new List<string>();
+            if (bytes == null)
             {
-                using (var ms = new MemoryStream(bytes, 0, bytes.Length, writable: false))
-
-                using (var reader = new BinaryReader(ms))
+                return result;
+            }
+            var offset = 0;
+            while (offset + 12 <= bytes.Length)
+            {
+                int fullMsgLength = BitConverter.ToInt32(bytes, offset);
+                // 包体长度 = 总长度 - (第二个长度字段4 + 包类型2 + 加密1 + 保留1 + 结尾1)
+                if (fullMsgLength < 9 || offset + 4 + fullMsgLength > bytes.Length)
                 {
-                    int fullMsgLength = reader.ReadInt32();
-                    int fullMsgLength2 = reader.ReadInt32();
-
-                    int bodyLength = fullMsgLength - 1 - 4 - 4;
-                    short packType = reader.ReadInt16();
-                    short encrypted = reader.ReadByte();
-                    short reserved = reader.ReadByte();
-                    var _bytes = reader.ReadBytes(bodyLength);
-                    byte zero = reader.ReadByte();
-                    return Encoding.UTF8.GetString(_bytes);
+                    break;
                 }
-
+                var bodyLength = fullMsgLength - 9;
+                if (bodyLength > 0)
+                {
+                    result.Add(Encoding.UTF8.GetString(bytes, offset + 12, bodyLength));
+                }
+                offset += 4 + fullMsgLength;
             }
-            catch (Exception)
-            {
-
-                return "";
-            }
-
+            return result;
         }
         //辣鸡STT
         private JToken SttToJObject(string str)

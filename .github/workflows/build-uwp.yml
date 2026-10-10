@@ -1,0 +1,99 @@
+name: Build AllLive UWP (sideload)
+
+# 手动触发，或推送到 master 时自动构建
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+
+jobs:
+  build-uwp:
+    # windows-2022 镜像预装了:
+    #   Microsoft.VisualStudio.Workload.Universal (UWP 工作负载)
+    #   Microsoft.VisualStudio.ComponentGroup.UWP.NetCoreAndStandard
+    #   Microsoft.VisualStudio.ComponentGroup.MSIX.Packaging
+    #   Windows SDK 10.0.19041.0 / 10.0.22621.0
+    runs-on: windows-2022
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: 还原 NuGet 包
+        # 工程用的是 PackageReference 风格，msbuild -t:Restore 比 nuget.exe restore 可靠
+        run: >
+          msbuild AllLive.sln
+          /t:Restore
+          /p:Configuration=Release
+          /p:Platform=x64
+          /v:minimal
+
+      - name: 生成自签名证书
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cert = New-SelfSignedCertificate `
+            -Type Custom `
+            -Subject "CN=AllLiveDev" `
+            -KeyUsage DigitalSignature `
+            -FriendlyName "AllLive Dev" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'build'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $pw = ConvertTo-SecureString -String 'AllLive123!' -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath "$dir/AllLiveDev.pfx" -Password $pw | Out-Null
+          Export-Certificate -Cert $cert -FilePath "$dir/AllLiveDev.cer" | Out-Null
+          Write-Host "证书指纹: $($cert.Thumbprint)"
+
+      - name: 编译 UWP (Release x64)
+        # 必须编译整个解决方案: 解决方案把 Release|x64 映射为 AllLive.Core 的
+        # Release|Any CPU，只有这样 AllLive.Core 才会定义 WINDOWS_UWP，
+        # 走作者预期的分支（否则会走 QuickJS 分支，UWP 下不可用）。
+        # UseDotNetNativeToolchain 覆盖为 false: CI 镜像没有 .NET Native 工具链。
+        run: >
+          msbuild AllLive.sln
+          /t:AllLive_UWP:Build
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:AppxBundle=Never
+          /p:UapAppxPackageBuildMode=SideloadOnly
+          /p:AppxPackageDir=${{ github.workspace }}/build/AppPackages/
+          /p:PackageCertificateKeyFile=${{ github.workspace }}/build/AllLiveDev.pfx
+          /p:PackageCertificatePassword=AllLive123!
+          /p:AppxPackageSigningEnabled=true
+          /p:UseDotNetNativeToolchain=false
+          /m
+          /v:minimal
+
+      - name: 列出产物
+        shell: pwsh
+        if: always()
+        run: |
+          Write-Host '--- AppPackages ---'
+          Get-ChildItem -Recurse build/AppPackages -ErrorAction SilentlyContinue |
+            Select-Object -First 40 FullName, Length
+          Write-Host '--- 松散目录 (bin/x64/Release) ---'
+          Get-ChildItem AllLive.UWP/bin/x64/Release -ErrorAction SilentlyContinue |
+            Select-Object -First 40 Name, Length
+
+      - name: 上传 AppPackages (已签名 appx + 依赖 + 证书)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AllLive-AppPackages
+          path: |
+            build/AppPackages/**
+            build/AllLiveDev.cer
+          if-no-files-found: warn
+
+      - name: 上传松散目录 (供 Add-AppxPackage -Register，免证书)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AllLive-LooseLayout
+          path: AllLive.UWP/bin/x64/Release/**
+          if-no-files-found: warn

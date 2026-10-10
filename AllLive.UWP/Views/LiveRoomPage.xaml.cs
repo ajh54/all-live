@@ -57,6 +57,10 @@ namespace AllLive.UWP.Views
         DispatcherTimer timer_focus;
         DispatcherTimer controlTimer;
 
+        /// <summary>连续重放同一线路的次数，避免「地址一直无效」时死循环</summary>
+        private int replayCount;
+        private const int MaxReplayCount = 3;
+
         public LiveRoomPage()
         {
             this.InitializeComponent();
@@ -177,6 +181,12 @@ namespace AllLive.UWP.Views
         #region 播放器事件
         private async void MediaPlayer_MediaEnded(MediaPlayer sender, object args)
         {
+            // 直播流被服务端结束（最典型的情况：斗鱼直链 300 秒会话到期）。
+            // 先用新签发的地址重放当前线路，只有刷新也失败才去换线路。
+            if (await ReplayCurrentLineAsync())
+            {
+                return;
+            }
             await this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
                 var index = liveRoomVM.Lines.IndexOf(liveRoomVM.CurrentLine);
@@ -190,6 +200,32 @@ namespace AllLive.UWP.Views
                     liveRoomVM.CurrentLine = liveRoomVM.Lines[index + 1];
                 }
             });
+        }
+
+        /// <summary>
+        /// 重新签发当前线路的播放地址并重放。
+        /// 连续重放超过上限（说明不是地址过期，而是这条线路真的有问题）时返回 false，
+        /// 交回给调用方走原有的换线路逻辑。
+        /// </summary>
+        private async Task<bool> ReplayCurrentLineAsync()
+        {
+            if (replayCount >= MaxReplayCount)
+            {
+                return false;
+            }
+            var url = await liveRoomVM.RefreshCurrentLineUrlAsync();
+            if (string.IsNullOrEmpty(url))
+            {
+                return false;
+            }
+            replayCount++;
+            LogHelper.Log($"播放地址已刷新，重放当前线路（第 {replayCount} 次）", LogType.INFO);
+            await Task.Delay(1000);
+            await Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+            {
+                _ = SetPlayer(url);
+            });
+            return true;
         }
 
         private async void PlaybackSession_BufferingEnded(MediaPlaybackSession sender, object args)
@@ -232,6 +268,8 @@ namespace AllLive.UWP.Views
         {
             await this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
+                //播放成功，重置重放计数（地址失效时每次都能重新刷新）
+                replayCount = 0;
                 //保持屏幕常亮
                 dispRequest.RequestActive();
                 PlayerLoading.Visibility = Visibility.Collapsed;
@@ -555,6 +593,11 @@ namespace AllLive.UWP.Views
         private async void PlayError()
         {
             if (liveRoomVM.CurrentLine == null)
+            {
+                return;
+            }
+            // 先用新签发的地址重放当前线路（直链过期是常见原因），失败再切换线路
+            if (await ReplayCurrentLineAsync())
             {
                 return;
             }
