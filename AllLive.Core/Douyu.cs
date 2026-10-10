@@ -1,4 +1,4 @@
-﻿using AllLive.Core.Interface;
+using AllLive.Core.Interface;
 using AllLive.Core.Models;
 using System;
 using System.Collections.Generic;
@@ -11,9 +11,6 @@ using System.Xml.Linq;
 using System.Linq;
 
 
-#if !WINDOWS_UWP
-using QuickJS;
-#endif
 /*
  * 参考：
  * https://github.com/wbt5/real-url/blob/master/douyu.py
@@ -151,52 +148,53 @@ namespace AllLive.Core
             return obj["room"];
         }
 
-        private async Task<string> GetPlayArgs(string html, string rid)
+        private Task<string> GetPlayArgs(string html, string rid)
         {
-            //取加密的js
-            html = Regex.Match(html, @"(vdwdae325w_64we[\s\S]*function ub98484234[\s\S]*?)function").Groups[1].Value;
-            html = Regex.Replace(html, @"eval.*?;}", "strc;}");
-            var vaa= Environment.CurrentDirectory ;
-            
-#if WINDOWS_UWP
-            var jsonObj = new
-            {
-                html = html,
-                rid = rid
-            };
-            var result = await HttpUtil.PostJsonString("http://alive.nsapps.cn/api/AllLive/DouyuSign", Newtonsoft.Json.JsonConvert.SerializeObject(jsonObj));
-            var obj = JObject.Parse(result);
-            if (obj["code"].ToInt32() == 0)
-            {
-                return obj["data"].ToString();
-            }
-            return "";
-#else
-            using (QuickJSRuntime runtime = new QuickJSRuntime())
-            using (QuickJSContext context = runtime.CreateContext())
+            // 斗鱼取播放直链需要一组签名参数。关键点：**签名算法按房间下发**——
+            // homeH5Enc 给每个房间返回的加密 JS 里都带着自己的算法变体（实测四个
+            // 房间的模板两两都不同），所以只能把该房间的 JS 真的跑起来算，
+            // 不能硬编码算法。
+            //
+            // 原实现的两条分支现在都用不了：
+            //   UWP 分支把加密 JS 发给作者自建的第三方服务器
+            //   http://alive.nsapps.cn/api/AllLive/DouyuSign 算签名，
+            //   该服务已下线（域名无 A 记录），导致所有斗鱼直播间都取不到播放地址；
+            //   另一分支用 QuickJS，但要加载原生库，UWP 下不可用。
+            // 现改用纯托管的 Jint 引擎在本地执行该房间的 JS，两条分支统一。
+            try
             {
                 var did = "10000000000000000000000000001501";
-                var time = Core.Helper.Utils.GetTimestamp();
+                var time = Core.Helper.Utils.GetTimestamp().ToString();
 
-                context.Eval(html, "", JSEvalFlags.Global);
-                //调用ub98484234函数，返回格式化后的js
-                var jsCode = context.Eval("ub98484234()", "", JSEvalFlags.Global).ToString();
+                // 与作者原来的前处理一致：截出相关片段，并把 eval 短路掉
+                var script = Regex.Match(html, @"(vdwdae325w_64we[\s\S]*function ub98484234[\s\S]*?)function").Groups[1].Value;
+                script = Regex.Replace(script, @"eval.*?;}", "strc;}");
 
-                var v = Regex.Match(jsCode, @"v=(\d+)").Groups[1].Value;
-                //对参数进行MD5，替换掉JS的CryptoJS\.MD5
+                var engine = new Jint.Engine();
+                engine.Execute(script);
+
+                // 调 ub98484234() 拿到它拼好的 sign 函数源码
+                var jsCode = engine.Evaluate("ub98484234()").ToString();
+                var v = Regex.Match(jsCode ?? "", @"v=(\d+)").Groups[1].Value;
+                if (string.IsNullOrEmpty(v))
+                {
+                    return Task.FromResult("");
+                }
+
+                // 把 MD5 结果直接内联进代码，避免把 .NET 方法暴露给 JS
+                // （不依赖委托互操作，在 UWP/.NET Native 下更稳）
                 var rb = Core.Helper.Utils.ToMD5(rid + did + time + v);
+                var signCode = Regex.Replace(jsCode, @"return rt;\}\);?", "return rt;}");
+                signCode = Regex.Replace(signCode, @"\(function \(", "function sign(");
+                signCode = Regex.Replace(signCode, @"CryptoJS\.MD5\(cb\)\.toString\(\)", "\"" + rb + "\"");
+                engine.Execute(signCode);
 
-                var jsCode2 = Regex.Replace(jsCode, @"return rt;}\);?", "return rt;}");
-                //设置方法名为sign
-                jsCode2 = Regex.Replace(jsCode2, @"\(function \(", "function sign(");
-                //将JS中的MD5方法直接替换成加密完成的rb
-                jsCode2 = Regex.Replace(jsCode2, @"CryptoJS\.MD5\(cb\)\.toString\(\)", $@"""{rb}""");
-                context.Eval(jsCode2, "", JSEvalFlags.Global);
-                //返回参数
-                var args = context.Eval($"sign('{rid}','{did}','{time}')", "", JSEvalFlags.Global).ToString();
-                return args;
+                return Task.FromResult(engine.Evaluate($"sign('{rid}','{did}','{time}')").ToString());
             }
-#endif
+            catch (Exception)
+            {
+                return Task.FromResult("");
+            }
         }
 
         public async Task<LiveSearchResult> Search(string keyword, int page = 1)
