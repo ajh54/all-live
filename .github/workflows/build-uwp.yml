@@ -61,12 +61,11 @@ jobs:
           # 走 sln 的另一个好处: 只有经过 sln 的配置映射, AllLive.Core 才会拿到
           # Release|Any CPU 从而定义 WINDOWS_UWP（作者预期的分支）。
           #
-          # 固定使用 UseDotNetNativeToolchain=false（非 .NET Native），原因有二：
-          #   1) 斗鱼的本地签名改用纯托管 JS 引擎 Jint 实现，而 Jint 过不了
-          #      .NET Native 的 AOT 编译器（实测：加 Jint 后 Native 编译必失败）。
-          #   2) 绝不能让失败的 Native 尝试与退路的非 Native 编译共用中间目录——
-          #      那会产出“清单声明 Native 依赖、载荷却是非 Native”的混合包，
-          #      装到机器上表现为主界面闪一下就崩（缺 System.Memory 等程序集）。
+          # 固定使用 UseDotNetNativeToolchain=false（非 .NET Native）：
+          #   斗鱼的本地签名改用纯托管 JS 引擎 Jint 实现，而 Jint 过不了
+          #   .NET Native 的 AOT 编译器（实测：加 Jint 后 Native 编译必失败）。
+          # 另外别让 Native 与非 Native 共用中间目录，否则会产出清单与载荷
+          # 形态不一致的混合包。
           $msbuildArgs = @(
             'AllLive.sln',
             '/p:Configuration=Release',
@@ -155,6 +154,45 @@ jobs:
             $problems += 'AppxManifest.xml'
           }
 
+          # 4) 包内布局：这一项是实测踩出来的坑，必须守住。
+          #    MSIX 根目录的 AllLive.UWP.exe 必须是 ≈8KB 的本机启动器（负责拉起
+          #    UWP 版 CoreCLR），托管主程序必须放在 entrypoint\ 下。
+          #    如果托管 exe 被放到根目录，系统会用【桌面 .NET Framework】去加载它，
+          #    启动即报“未能加载 System.Private.CoreLib”并闪退（异常码 e0434352）。
+          $msix = Get-ChildItem build/AppPackages -Recurse -Filter '*.msix' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $msix) {
+            Write-Host '::error::没有生成 msix，无法校验包内布局'
+            $problems += 'msix'
+          } else {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($msix.FullName)
+            try {
+              $rootEntry = $zip.Entries | Where-Object { $_.FullName -eq 'AllLive.UWP.exe' }
+              $entryEntry = $zip.Entries | Where-Object { $_.FullName -eq 'entrypoint/AllLive.UWP.exe' }
+              if (-not $rootEntry) {
+                Write-Host '::error::msix 根目录缺 AllLive.UWP.exe'
+                $problems += 'msix 根 exe 缺失'
+              } elseif ($rootEntry.Length -ge 65536) {
+                Write-Host ("::error::msix 根目录的 AllLive.UWP.exe 有 {0:N0} 字节（托管程序集），应为 ≈8KB 的本机启动器" -f $rootEntry.Length)
+                $problems += 'msix 根 exe 形态不对'
+              } else {
+                Write-Host ("  msix 根 AllLive.UWP.exe        {0,10:N0} 字节  (本机启动器) ✓" -f $rootEntry.Length)
+              }
+              if (-not $entryEntry) {
+                Write-Host '::error::msix 缺 entrypoint\AllLive.UWP.exe（托管主程序）'
+                $problems += 'msix entrypoint 缺失'
+              } elseif ($entryEntry.Length -lt 65536) {
+                Write-Host ("::error::entrypoint\AllLive.UWP.exe 只有 {0:N0} 字节，不像托管主程序" -f $entryEntry.Length)
+                $problems += 'msix entrypoint 形态不对'
+              } else {
+                Write-Host ("  msix entrypoint\AllLive.UWP.exe {0,10:N0} 字节  (托管主程序) ✓" -f $entryEntry.Length)
+              }
+            } finally {
+              $zip.Dispose()
+            }
+          }
+
           if ($problems.Count -gt 0) {
             Write-Host "::error::产物自检失败: $($problems -join ', ')"
             exit 1
@@ -180,12 +218,37 @@ jobs:
             build/AllLiveDev.cer
           if-no-files-found: warn
 
+      - name: 组装可直接注册的松散目录
+        if: always()
+        shell: pwsh
+        run: |
+          # Add-AppxPackage -Register 用的目录必须与 MSIX 包内布局一致：
+          #   根目录 AllLive.UWP.exe       = ≈8KB 本机启动器
+          #   entrypoint\AllLive.UWP.exe   = ≈350KB 托管主程序
+          # 直接把 bin/x64/Release 拿来注册是错的：那里托管 exe 在根目录、
+          # 启动器在 Core\ 子目录下，注册后系统会用桌面 .NET Framework 加载
+          # 托管 exe，启动就崩（System.Private.CoreLib 加载失败 / e0434352）。
+          # 最稳妥的做法：把已经打包好的 msix 解压出来当松散目录。
+          $out = 'build/loose-layout'
+          Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $msix = Get-ChildItem build/AppPackages -Recurse -Filter '*.msix' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $msix) { Write-Host '::warning::没有 msix，跳过松散目录组装'; exit 0 }
+          Copy-Item $msix.FullName "$out/package.zip" -Force
+          Expand-Archive "$out/package.zip" -DestinationPath $out -Force
+          Remove-Item "$out/package.zip" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$out/AppxSignature.p7x", "$out/AppxBlockMap.xml" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$out/[Content_Types].xml" -Force -ErrorAction SilentlyContinue
+          Get-Item "$out/AllLive.UWP.exe", "$out/entrypoint/AllLive.UWP.exe" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("  {0}  {1:N0} 字节" -f $_.FullName, $_.Length) }
+
       - name: 上传松散目录 (供 Add-AppxPackage -Register，免证书)
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: AllLive-LooseLayout
-          path: AllLive.UWP/bin/x64/Release/**
+          path: build/loose-layout/**
           if-no-files-found: warn
 
       - name: 上传编译日志 (失败时用来排查)
