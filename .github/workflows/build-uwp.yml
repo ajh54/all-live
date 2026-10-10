@@ -51,9 +51,8 @@ jobs:
           # 工程里钉死了作者的证书指纹，必须用新证书的指纹覆盖，否则签名阶段会报不匹配
           "CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
 
-      - name: 编译 UWP (Release x64, .NET Native)
+      - name: 编译 UWP (Release x64)
         id: build
-        continue-on-error: true
         shell: pwsh
         run: |
           # 直接编译整个解决方案（等同于 VS 的“生成解决方案”）。
@@ -62,9 +61,12 @@ jobs:
           # 走 sln 的另一个好处: 只有经过 sln 的配置映射, AllLive.Core 才会拿到
           # Release|Any CPU 从而定义 WINDOWS_UWP（作者预期的分支）。
           #
-          # 这里按工程原本的配置走 .NET Native（Release 配置里设为 true），
-          # 这是作者发布时用的形态：产物自包含，不需要额外安装
-          # Microsoft.NET.CoreRuntime / CoreFramework.Debug 框架包。
+          # 固定使用 UseDotNetNativeToolchain=false（非 .NET Native），原因有二：
+          #   1) 斗鱼的本地签名改用纯托管 JS 引擎 Jint 实现，而 Jint 过不了
+          #      .NET Native 的 AOT 编译器（实测：加 Jint 后 Native 编译必失败）。
+          #   2) 绝不能让失败的 Native 尝试与退路的非 Native 编译共用中间目录——
+          #      那会产出“清单声明 Native 依赖、载荷却是非 Native”的混合包，
+          #      装到机器上表现为主界面闪一下就崩（缺 System.Memory 等程序集）。
           $msbuildArgs = @(
             'AllLive.sln',
             '/p:Configuration=Release',
@@ -72,6 +74,7 @@ jobs:
             '/p:AppxBundle=Never',
             '/p:UapAppxPackageBuildMode=SideloadOnly',
             '/p:GenerateAppxPackageOnBuild=true',
+            '/p:UseDotNetNativeToolchain=false',
             "/p:AppxPackageDir=$env:GITHUB_WORKSPACE/build/AppPackages/",
             "/p:PackageCertificateKeyFile=$env:GITHUB_WORKSPACE/build/AllLiveDev.pfx",
             '/p:PackageCertificatePassword=AllLive123!',
@@ -85,7 +88,7 @@ jobs:
           exit $LASTEXITCODE
 
       - name: 提取编译错误到注解
-        if: steps.build.outcome == 'failure'
+        if: failure()
         shell: pwsh
         run: |
           if (-not (Test-Path build.log)) { Write-Host '没有 build.log'; exit 0 }
@@ -100,35 +103,58 @@ jobs:
             $lines | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
           }
 
-      - name: 退路：关闭 .NET Native 再编一次
-        id: build_nonnative
-        if: steps.build.outcome == 'failure'
-        continue-on-error: true
+      - name: 产物自检（缺程序集或清单不一致就立刻失败）
         shell: pwsh
         run: |
-          Write-Host '.NET Native 编译失败（可能 CI 镜像没有该工具链），改为非 Native 方式再编一次'
-          Write-Host '注意: 这种产物需要系统预装 Microsoft.NET.CoreRuntime.2.2 与 CoreFramework.Debug.2.2'
-          & msbuild AllLive.sln `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /p:AppxBundle=Never `
-            /p:UapAppxPackageBuildMode=SideloadOnly `
-            /p:GenerateAppxPackageOnBuild=true `
-            "/p:AppxPackageDir=$env:GITHUB_WORKSPACE/build/AppPackages/" `
-            "/p:PackageCertificateKeyFile=$env:GITHUB_WORKSPACE/build/AllLiveDev.pfx" `
-            /p:PackageCertificatePassword=AllLive123! `
-            "/p:PackageCertificateThumbprint=$env:CERT_THUMBPRINT" `
-            /p:AppxPackageSigningEnabled=true `
-            /p:UseDotNetNativeToolchain=false `
-            /m /v:normal 2>&1 | Tee-Object -FilePath build-nonnative.log
-          exit $LASTEXITCODE
+          # 非 .NET Native 的 UWP 包必须自带这些程序集，少一个装上去就是启动即崩。
+          # Jint/Acornima 是斗鱼本地签名用的；System.Memory/Buffers/Unsafe/Vectors
+          # 是 Jint 的依赖，必须随包发布。
+          $layout = 'AllLive.UWP/bin/x64/Release'
+          $required = @(
+            'AllLive.UWP.exe',
+            'AllLive.UWP.dll',
+            'AllLive.Core.dll',
+            'Jint.dll',
+            'Acornima.dll',
+            'System.Memory.dll',
+            'System.Buffers.dll',
+            'System.Runtime.CompilerServices.Unsafe.dll',
+            'System.Numerics.Vectors.dll'
+          )
+          $missing = @()
+          Write-Host "--- 产物清单 ($layout) ---"
+          foreach ($f in $required) {
+            $p = Join-Path $layout $f
+            if (Test-Path $p) {
+              Write-Host ("  {0,-46} {1,10:N0} 字节  ✓" -f $f, (Get-Item $p).Length)
+            } else {
+              Write-Host ("  {0,-46} 缺失  ✗" -f $f)
+              $missing += $f
+            }
+          }
 
-      - name: 两种方式都失败才判定失败
-        if: steps.build.outcome == 'failure' && steps.build_nonnative.outcome == 'failure'
-        shell: pwsh
-        run: |
-          Write-Host "::error::.NET Native 与非 Native 两种方式都编译失败，请看 build.log / build-nonnative.log"
-          exit 1
+          # 清单声明的依赖必须与非 Native 一致
+          $mf = Join-Path $layout 'AppxManifest.xml'
+          if (Test-Path $mf) {
+            $raw = Get-Content $mf -Raw
+            if ($raw -match 'Native\.Framework|Native\.Runtime') {
+              Write-Host '::error::产物清单声明的是 .NET Native 依赖，但实际用的是非 Native 编译 —— 这是混合产物，装上会闪退'
+              $missing += 'AppxManifest 依赖声明不一致'
+            } else {
+              Write-Host ''
+              Write-Host 'AppxManifest 依赖声明: 非 Native (CoreRuntime/CoreFramework) ✓'
+            }
+          } else {
+            Write-Host '::error::找不到 AppxManifest.xml'
+            $missing += 'AppxManifest.xml'
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Host "::error::产物自检失败，缺少或异常: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host ''
+          Write-Host '产物自检通过 ✓'
 
       - name: 列出产物
         if: always()
@@ -137,11 +163,8 @@ jobs:
           Write-Host '--- AppPackages ---'
           Get-ChildItem -Recurse build/AppPackages -ErrorAction SilentlyContinue |
             Select-Object -First 40 FullName, Length
-          Write-Host '--- 松散目录 (bin/x64/Release) ---'
-          Get-ChildItem AllLive.UWP/bin/x64/Release -ErrorAction SilentlyContinue |
-            Select-Object -First 40 Name, Length
 
-      - name: 上传 AppPackages (已签名 appx + 依赖 + 证书)
+      - name: 上传 AppPackages (已签名 msix + 依赖 + 证书)
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -164,7 +187,5 @@ jobs:
         if: always()
         with:
           name: build-logs
-          path: |
-            build.log
-            build-nonnative.log
+          path: build.log
           if-no-files-found: ignore
