@@ -51,17 +51,20 @@ jobs:
           # 工程里钉死了作者的证书指纹，必须用新证书的指纹覆盖，否则签名阶段会报不匹配
           "CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
 
-      - name: 编译 UWP (Release x64)
+      - name: 编译 UWP (Release x64, .NET Native)
         id: build
         continue-on-error: true
         shell: pwsh
         run: |
           # 直接编译整个解决方案（等同于 VS 的“生成解决方案”）。
           # 不要写成 /t:AllLive_UWP:Build —— 解决方案 metaproj 里的目标名
-          # 对不上会报 MSB4057: The target "AllLive_UWP:Build" does not exist。
+          # 对不上会报 MSB4057。
           # 走 sln 的另一个好处: 只有经过 sln 的配置映射, AllLive.Core 才会拿到
           # Release|Any CPU 从而定义 WINDOWS_UWP（作者预期的分支）。
-          # UseDotNetNativeToolchain=false: CI 镜像没有 .NET Native 工具链。
+          #
+          # 这里按工程原本的配置走 .NET Native（Release 配置里设为 true），
+          # 这是作者发布时用的形态：产物自包含，不需要额外安装
+          # Microsoft.NET.CoreRuntime / CoreFramework.Debug 框架包。
           $msbuildArgs = @(
             'AllLive.sln',
             '/p:Configuration=Release',
@@ -74,7 +77,6 @@ jobs:
             '/p:PackageCertificatePassword=AllLive123!',
             "/p:PackageCertificateThumbprint=$env:CERT_THUMBPRINT",
             '/p:AppxPackageSigningEnabled=true',
-            '/p:UseDotNetNativeToolchain=false',
             '/m',
             '/v:normal'
           )
@@ -98,28 +100,34 @@ jobs:
             $lines | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
           }
 
-      - name: 退路：关闭签名再编一次
-        id: build_nosign
+      - name: 退路：关闭 .NET Native 再编一次
+        id: build_nonnative
         if: steps.build.outcome == 'failure'
         continue-on-error: true
         shell: pwsh
         run: |
-          Write-Host '第一次(带签名)失败，改为不签名编译，目标只是拿到松散目录'
+          Write-Host '.NET Native 编译失败（可能 CI 镜像没有该工具链），改为非 Native 方式再编一次'
+          Write-Host '注意: 这种产物需要系统预装 Microsoft.NET.CoreRuntime.2.2 与 CoreFramework.Debug.2.2'
           & msbuild AllLive.sln `
             /p:Configuration=Release `
             /p:Platform=x64 `
             /p:AppxBundle=Never `
-            /p:AppxPackageSigningEnabled=false `
-            /p:GenerateAppxPackageOnBuild=false `
+            /p:UapAppxPackageBuildMode=SideloadOnly `
+            /p:GenerateAppxPackageOnBuild=true `
+            "/p:AppxPackageDir=$env:GITHUB_WORKSPACE/build/AppPackages/" `
+            "/p:PackageCertificateKeyFile=$env:GITHUB_WORKSPACE/build/AllLiveDev.pfx" `
+            /p:PackageCertificatePassword=AllLive123! `
+            "/p:PackageCertificateThumbprint=$env:CERT_THUMBPRINT" `
+            /p:AppxPackageSigningEnabled=true `
             /p:UseDotNetNativeToolchain=false `
-            /m /v:normal 2>&1 | Tee-Object -FilePath build-nosign.log
+            /m /v:normal 2>&1 | Tee-Object -FilePath build-nonnative.log
           exit $LASTEXITCODE
 
-      - name: 两次都失败才判定失败
-        if: steps.build.outcome == 'failure' && steps.build_nosign.outcome == 'failure'
+      - name: 两种方式都失败才判定失败
+        if: steps.build.outcome == 'failure' && steps.build_nonnative.outcome == 'failure'
         shell: pwsh
         run: |
-          Write-Host "::error::带签名和不签名两种方式都编译失败，请看 build.log / build-nosign.log"
+          Write-Host "::error::.NET Native 与非 Native 两种方式都编译失败，请看 build.log / build-nonnative.log"
           exit 1
 
       - name: 列出产物
@@ -158,5 +166,5 @@ jobs:
           name: build-logs
           path: |
             build.log
-            build-nosign.log
+            build-nonnative.log
           if-no-files-found: ignore
