@@ -1,6 +1,5 @@
 name: Build AllLive UWP (sideload)
 
-# 手动触发，或推送到 master 时自动构建
 on:
   workflow_dispatch:
   push:
@@ -32,6 +31,7 @@ jobs:
           /v:minimal
 
       - name: 生成自签名证书
+        id: cert
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -48,30 +48,81 @@ jobs:
           Export-PfxCertificate -Cert $cert -FilePath "$dir/AllLiveDev.pfx" -Password $pw | Out-Null
           Export-Certificate -Cert $cert -FilePath "$dir/AllLiveDev.cer" | Out-Null
           Write-Host "证书指纹: $($cert.Thumbprint)"
+          # 工程里钉死了作者的证书指纹，必须用新证书的指纹覆盖，否则签名阶段会报不匹配
+          "CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
 
       - name: 编译 UWP (Release x64)
-        # 必须编译整个解决方案: 解决方案把 Release|x64 映射为 AllLive.Core 的
-        # Release|Any CPU，只有这样 AllLive.Core 才会定义 WINDOWS_UWP，
-        # 走作者预期的分支（否则会走 QuickJS 分支，UWP 下不可用）。
-        # UseDotNetNativeToolchain 覆盖为 false: CI 镜像没有 .NET Native 工具链。
-        run: >
-          msbuild AllLive.sln
-          /t:AllLive_UWP:Build
-          /p:Configuration=Release
-          /p:Platform=x64
-          /p:AppxBundle=Never
-          /p:UapAppxPackageBuildMode=SideloadOnly
-          /p:AppxPackageDir=${{ github.workspace }}/build/AppPackages/
-          /p:PackageCertificateKeyFile=${{ github.workspace }}/build/AllLiveDev.pfx
-          /p:PackageCertificatePassword=AllLive123!
-          /p:AppxPackageSigningEnabled=true
-          /p:UseDotNetNativeToolchain=false
-          /m
-          /v:minimal
+        id: build
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # 编译整个解决方案: 解决方案把 Release|x64 映射为 AllLive.Core 的 Release|Any CPU，
+          # 只有这样才能命中 WINDOWS_UWP 定义（否则会走 QuickJS 分支，UWP 下不可用）。
+          # UseDotNetNativeToolchain=false: CI 镜像没有 .NET Native 工具链。
+          $msbuildArgs = @(
+            'AllLive.sln',
+            '/t:AllLive_UWP:Build',
+            '/p:Configuration=Release',
+            '/p:Platform=x64',
+            '/p:AppxBundle=Never',
+            '/p:UapAppxPackageBuildMode=SideloadOnly',
+            "/p:AppxPackageDir=$env:GITHUB_WORKSPACE/build/AppPackages/",
+            "/p:PackageCertificateKeyFile=$env:GITHUB_WORKSPACE/build/AllLiveDev.pfx",
+            '/p:PackageCertificatePassword=AllLive123!',
+            "/p:PackageCertificateThumbprint=$env:CERT_THUMBPRINT",
+            '/p:AppxPackageSigningEnabled=true',
+            '/p:UseDotNetNativeToolchain=false',
+            '/m',
+            '/v:normal'
+          )
+          Write-Host "msbuild $($msbuildArgs -join ' ')"
+          & msbuild @msbuildArgs 2>&1 | Tee-Object -FilePath build.log
+          exit $LASTEXITCODE
+
+      - name: 提取编译错误到注解
+        if: steps.build.outcome == 'failure'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build.log)) { Write-Host '没有 build.log'; exit 0 }
+          $lines = Get-Content build.log
+          $errs = $lines |
+            Where-Object { $_ -match 'error [A-Z]{2,}\d+|error MSB\d+|error APPX\d+|Build FAILED|生成失败|MSB4057' } |
+            Select-Object -Unique | Select-Object -First 25
+          if ($errs.Count -gt 0) {
+            foreach ($e in $errs) { Write-Host "::error::$($e.Trim())" }
+          } else {
+            Write-Host '::error::没匹配到典型错误行，下面输出日志尾部'
+            $lines | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
+          }
+
+      - name: 退路：关闭签名再编一次
+        id: build_nosign
+        if: steps.build.outcome == 'failure'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Write-Host '第一次(带签名)失败，改为不签名编译，目标只是拿到松散目录'
+          & msbuild AllLive.sln `
+            /t:AllLive_UWP:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:AppxBundle=Never `
+            /p:AppxPackageSigningEnabled=false `
+            /p:GenerateAppxPackageOnBuild=false `
+            /p:UseDotNetNativeToolchain=false `
+            /m /v:normal 2>&1 | Tee-Object -FilePath build-nosign.log
+          exit $LASTEXITCODE
+
+      - name: 两次都失败才判定失败
+        if: steps.build.outcome == 'failure' && steps.build_nosign.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Host "::error::带签名和不签名两种方式都编译失败，请看 build.log / build-nosign.log"
+          exit 1
 
       - name: 列出产物
-        shell: pwsh
         if: always()
+        shell: pwsh
         run: |
           Write-Host '--- AppPackages ---'
           Get-ChildItem -Recurse build/AppPackages -ErrorAction SilentlyContinue |
@@ -97,3 +148,13 @@ jobs:
           name: AllLive-LooseLayout
           path: AllLive.UWP/bin/x64/Release/**
           if-no-files-found: warn
+
+      - name: 上传编译日志 (失败时用来排查)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: |
+            build.log
+            build-nosign.log
+          if-no-files-found: ignore
