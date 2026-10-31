@@ -33,9 +33,10 @@ jobs:
         run: |
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/simplelive.p12"
           chmod 600 "$RUNNER_TEMP/simplelive.p12"
-          keytool -list -keystore "$RUNNER_TEMP/simplelive.p12" -storetype PKCS12 -storepass:env KEYSTORE_PASSWORD -alias simplelive
-          printf 'storeFile=%s\nstorePassword=%s\nkeyPassword=%s\nkeyAlias=simplelive\n' \
-            "$RUNNER_TEMP/simplelive.p12" "$KEYSTORE_PASSWORD" "$KEYSTORE_PASSWORD" \
+          KEY_ALIAS=$(keytool -list -J-Duser.language=en -keystore "$RUNNER_TEMP/simplelive.p12" -storetype PKCS12 -storepass:env KEYSTORE_PASSWORD | awk -F, '/PrivateKeyEntry/ {print $1; exit}')
+          test -n "$KEY_ALIAS"
+          printf 'storeFile=%s\nstorePassword=%s\nkeyPassword=%s\nkeyAlias=%s\n' \
+            "$RUNNER_TEMP/simplelive.p12" "$KEYSTORE_PASSWORD" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" \
             > android-source/simple_live_app/android/key.properties
       - name: Restore Flutter dependencies
         working-directory: android-source/simple_live_app
