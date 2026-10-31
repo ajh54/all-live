@@ -78,6 +78,7 @@ namespace AllLive.UWP.ViewModels
         private long? FavoriteID { get; set; }
 
         object RoomId;
+        private int roomLoadVersion;
         public LiveRoomDetail detail { get; set; }
 
         private long _Online = 0;
@@ -224,6 +225,7 @@ namespace AllLive.UWP.ViewModels
 
         public async void LoadData(ILiveSite site, object roomId)
         {
+            roomLoadVersion++;
             try
             {
                 Loading = true;
@@ -411,7 +413,7 @@ namespace AllLive.UWP.ViewModels
         }
 
         /// <summary>
-        /// 重新获取当前线路的播放直链（斗鱼直链有 300 秒会话上限，到点必须换新链接），
+        /// 重新获取房间、鉴权、清晰度及当前线路的播放地址。
         /// 成功返回新地址，失败返回 null。
         /// </summary>
         public async Task<string> RefreshCurrentLineUrlAsync()
@@ -422,23 +424,58 @@ namespace AllLive.UWP.ViewModels
             }
             try
             {
-                var index = Lines.IndexOf(CurrentLine);
+                var previousDetail = detail;
+                var version = roomLoadVersion;
+                var previousQuality = CurrentQuality;
+                var previousLine = CurrentLine;
+                var previousLines = Lines;
+                var index = previousLines.IndexOf(previousLine);
                 if (index < 0)
                 {
                     return null;
                 }
-                var data = await Site.GetPlayUrls(detail, CurrentQuality);
-                if (data == null || data.Count == 0)
+                // detail.Data 可能保存带时间戳的签名，不能用于长期重连。
+                var freshDetail = await Site.GetRoomDetail(RoomId);
+                if (version != roomLoadVersion || detail != previousDetail || CurrentLine != previousLine || CurrentQuality != previousQuality)
+                    return null;
+                if (freshDetail == null)
+                    throw new InvalidOperationException("未取得房间信息，无法确认开播状态");
+                if (!freshDetail.Status)
                 {
+                    Living = false;
+                    LogHelper.Log("平台返回直播间已下播", LogType.INFO);
                     return null;
                 }
-                // 服务端返回的线路顺序是稳定的，优先复用同一序号，越界时回退到第一条
-                var url = index < data.Count ? data[index] : data[0];
+                var freshQualities = await Site.GetPlayQuality(freshDetail);
+                if (freshQualities == null || freshQualities.Count == 0)
+                    throw new InvalidOperationException("刷新后未取得可用清晰度");
+                var freshQuality = freshQualities.FirstOrDefault(q => q.Quality == previousQuality.Quality)
+                    ?? freshQualities[0];
+                var data = await Site.GetPlayUrls(freshDetail, freshQuality);
+                if (version != roomLoadVersion || detail != previousDetail || CurrentLine != previousLine || CurrentQuality != previousQuality)
+                    return null;
+                if (data == null || data.Count == 0)
+                {
+                    throw new InvalidOperationException("刷新后未取得可用播放地址");
+                }
+                var newIndex = index < data.Count ? index : 0;
+                var url = data[newIndex];
                 if (string.IsNullOrEmpty(url))
                 {
                     return null;
                 }
-                Lines[index].Url = url;
+                detail = freshDetail;
+                // 更新后备线路，避免切线时再次使用旧地址；直接更新 backing field 避免触发重复取流。
+                var freshLines = data.Select((value, i) => new PlayurlLine
+                {
+                    Name = $"线路{i + 1}", Url = value
+                }).ToList();
+                currentQuality = freshQuality;
+                currentLine = freshLines[newIndex];
+                Qualities = freshQualities;
+                Lines = freshLines;
+                DoPropertyChanged("CurrentQuality");
+                DoPropertyChanged("CurrentLine");
                 return url;
             }
             catch (Exception ex)

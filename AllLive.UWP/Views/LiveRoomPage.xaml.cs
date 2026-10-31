@@ -60,6 +60,9 @@ namespace AllLive.UWP.Views
         /// <summary>连续重放同一线路的次数，避免「地址一直无效」时死循环</summary>
         private int replayCount;
         private const int MaxReplayCount = 3;
+        private bool recoveringPlayback;
+        private bool playbackStopped;
+        private int playbackVersion;
 
         public LiveRoomPage()
         {
@@ -181,51 +184,40 @@ namespace AllLive.UWP.Views
         #region 播放器事件
         private async void MediaPlayer_MediaEnded(MediaPlayer sender, object args)
         {
-            // 直播流被服务端结束（最典型的情况：斗鱼直链 300 秒会话到期）。
-            // 先用新签发的地址重放当前线路，只有刷新也失败才去换线路。
-            if (await ReplayCurrentLineAsync())
-            {
-                return;
-            }
             await this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
-                var index = liveRoomVM.Lines.IndexOf(liveRoomVM.CurrentLine);
-                //尝试切换
-                if (index == liveRoomVM.Lines.Count - 1)
-                {
-                    liveRoomVM.Living = false;
-                }
-                else
-                {
-                    liveRoomVM.CurrentLine = liveRoomVM.Lines[index + 1];
-                }
+                LogHelper.Log("直播流结束，尝试重新获取播放地址", LogType.INFO);
+                PlayError();
             });
         }
 
         /// <summary>
         /// 重新签发当前线路的播放地址并重放。
-        /// 连续重放超过上限（说明不是地址过期，而是这条线路真的有问题）时返回 false，
+        /// 连续重放超过上限时返回 false，避免网络或鉴权持续失败时无限重试。
         /// 交回给调用方走原有的换线路逻辑。
         /// </summary>
         private async Task<bool> ReplayCurrentLineAsync()
         {
+            var version = playbackVersion;
             if (replayCount >= MaxReplayCount)
             {
                 return false;
             }
+            replayCount++;
+            await Task.Delay(1000 * replayCount);
+            if (playbackStopped || version != playbackVersion) return true;
+            var previousLine = liveRoomVM.CurrentLine;
+            var previousQuality = liveRoomVM.CurrentQuality;
             var url = await liveRoomVM.RefreshCurrentLineUrlAsync();
+            if (playbackStopped || version != playbackVersion) return true;
             if (string.IsNullOrEmpty(url))
             {
+                if (previousLine != liveRoomVM.CurrentLine || previousQuality != liveRoomVM.CurrentQuality)
+                    return true; // 用户已切线或切换清晰度，放弃旧的重连。
                 return false;
             }
-            replayCount++;
             LogHelper.Log($"播放地址已刷新，重放当前线路（第 {replayCount} 次）", LogType.INFO);
-            await Task.Delay(1000);
-            await Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
-            {
-                _ = SetPlayer(url);
-            });
-            return true;
+            return await SetPlayer(url);
         }
 
         private async void PlaybackSession_BufferingEnded(MediaPlaybackSession sender, object args)
@@ -256,6 +248,7 @@ namespace AllLive.UWP.Views
 
         private async void MediaPlayer_MediaFailed(MediaPlayer sender, MediaPlayerFailedEventArgs args)
         {
+            LogHelper.Log($"播放器错误：{args.Error}；{args.ErrorMessage}；HRESULT={args.ExtendedErrorCode?.HResult:X8}", LogType.ERROR);
             await this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
 
@@ -513,12 +506,20 @@ namespace AllLive.UWP.Views
         }
 
 
-        private void LiveRoomVM_ChangedPlayUrl(object sender, string e)
+        private async void LiveRoomVM_ChangedPlayUrl(object sender, string e)
         {
-            _ = SetPlayer(e);
+            var version = ++playbackVersion;
+            if (!await SetPlayer(e))
+            {
+                while (recoveringPlayback && !playbackStopped && version == playbackVersion)
+                    await Task.Delay(50);
+                if (!playbackStopped && version == playbackVersion) PlayError();
+            }
         }
-        private async Task SetPlayer(string url)
+        private async Task<bool> SetPlayer(string url)
         {
+            if (playbackStopped) return false;
+            var version = playbackVersion;
             try
             {
                 PlayerLoading.Visibility = Visibility.Visible;
@@ -569,54 +570,78 @@ namespace AllLive.UWP.Views
                 }
                 try
                 {
-                    interopMSS = await FFmpegMediaSource.CreateFromUriAsync(url, config);
+                    var source = await FFmpegMediaSource.CreateFromUriAsync(url, config);
+                    if (playbackStopped || version != playbackVersion)
+                    {
+                        source.Dispose();
+                        return false;
+                    }
+                    interopMSS = source;
                 }
                 catch (Exception ex)
                 {
                     LogHelper.Log("播放器初始化失败", LogType.ERROR, ex);
-                    PlayError();
-                    return;
+                    return false;
                 }
 
                 mediaPlayer.AutoPlay = true;
                 mediaPlayer.Volume = SliderVolume.Value;
                 mediaPlayer.Source = interopMSS.CreateMediaPlaybackItem();
                 player.SetMediaPlayer(mediaPlayer);
+                return true;
             }
             catch (Exception ex)
             {
                 Utils.ShowMessageToast("播放失败" + ex.Message);
+                LogHelper.Log("设置播放源失败", LogType.ERROR, ex);
+                return false;
             }
 
         }
 
         private async void PlayError()
         {
-            if (liveRoomVM.CurrentLine == null)
+            if (recoveringPlayback || playbackStopped || liveRoomVM.CurrentLine == null)
             {
                 return;
             }
-            // 先用新签发的地址重放当前线路（直链过期是常见原因），失败再切换线路
-            if (await ReplayCurrentLineAsync())
+            recoveringPlayback = true;
+            try
             {
-                return;
-            }
-            // 当前线路播放失败，尝试下一个线路
-            var index = liveRoomVM.Lines.IndexOf(liveRoomVM.CurrentLine);
-            if (index == liveRoomVM.Lines.Count - 1)
-            {
+                while (replayCount < MaxReplayCount)
+                {
+                    if (await ReplayCurrentLineAsync()) return;
+                    if (playbackStopped || !liveRoomVM.Living) return;
+                }
+                if (playbackStopped) return;
+                // 新地址仍失败时尝试下一条已刷新的线路。
+                var index = liveRoomVM.Lines.IndexOf(liveRoomVM.CurrentLine);
+                if (index >= 0 && index + 1 < liveRoomVM.Lines.Count)
+                {
+                    var nextLine = liveRoomVM.Lines[index + 1];
+                    replayCount = 0;
+                    liveRoomVM.CurrentLine = nextLine;
+                    return;
+                }
                 PlayerLoading.Visibility = Visibility.Collapsed;
-                LogHelper.Log("直播加载失败", LogType.ERROR, new Exception("直播加载失败"));
-                await new MessageDialog($"啊，播放失败了，请尝试以下操作\r\n1、更换清晰度或线路\r\n2、请尝试在直播设置中打开/关闭硬解试试", "播放失败").ShowAsync();
+                LogHelper.Log("直播加载失败，未确认主播下播", LogType.ERROR);
+                PlayerLoadText.Text = "连接中断";
+                await new MessageDialog("直播连接中断，重新获取播放地址失败。请刷新直播间或更换线路。", "连接中断").ShowAsync();
             }
-            else
+            catch (Exception ex)
             {
-                liveRoomVM.CurrentLine = liveRoomVM.Lines[index + 1];
+                LogHelper.Log("直播重连失败", LogType.ERROR, ex);
+            }
+            finally
+            {
+                recoveringPlayback = false;
             }
         }
 
         private void StopPlay()
         {
+            playbackStopped = true;
+            playbackVersion++;
             if (mediaPlayer != null)
             {
                 mediaPlayer.Pause();
@@ -698,6 +723,8 @@ namespace AllLive.UWP.Views
         }
         protected override void OnNavigatedTo(NavigationEventArgs e)
         {
+            playbackStopped = false;
+            replayCount = 0;
             base.OnNavigatedTo(e);
             if (e.NavigationMode == Windows.UI.Xaml.Navigation.NavigationMode.New)
             {
@@ -1431,6 +1458,8 @@ namespace AllLive.UWP.Views
         private void BottomBtnRefresh_Click(object sender, RoutedEventArgs e)
         {
             if (liveRoomVM.Loading) return;
+            playbackVersion++;
+            replayCount = 0;
             if (mediaPlayer != null)
             {
                 mediaPlayer.Pause();
