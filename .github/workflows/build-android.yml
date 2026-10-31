@@ -46,7 +46,8 @@ jobs:
           import re
           for path in [Path('pubspec.yaml'), Path('../simple_live_core/pubspec.yaml')]:
               text = path.read_text()
-              path.write_text(re.sub(r': \^(\d+\.\d+\.\d+[^\s#]*)', r': \1', text))
+              dependencies, marker, development = text.partition('dev_dependencies:')
+              path.write_text(re.sub(r': \^(\d+\.\d+\.\d+[^\s#]*)', r': \1', dependencies) + marker + development)
           PY
           flutter pub get
       - name: Build release APK
