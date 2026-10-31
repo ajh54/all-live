@@ -1,0 +1,64 @@
+name: Build Simple Live Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [build/android-apk]
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: xiaoyaocz/dart_simple_live
+          ref: ba828e6783b176ea5709fcd09f0eb01dfaceeb51
+          path: android-source
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: android-source/simple_live_app/android/**/*.gradle*
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.x'
+          channel: stable
+          cache: true
+      - name: Configure private Android signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SIMPLELIVE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.SIMPLELIVE_KEYSTORE_PASSWORD }}
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/simplelive.p12"
+          chmod 600 "$RUNNER_TEMP/simplelive.p12"
+          keytool -list -keystore "$RUNNER_TEMP/simplelive.p12" -storetype PKCS12 -storepass:env KEYSTORE_PASSWORD -alias simplelive
+          printf 'storeFile=%s\nstorePassword=%s\nkeyPassword=%s\nkeyAlias=simplelive\n' \
+            "$RUNNER_TEMP/simplelive.p12" "$KEYSTORE_PASSWORD" "$KEYSTORE_PASSWORD" \
+            > android-source/simple_live_app/android/key.properties
+      - name: Restore Flutter dependencies
+        working-directory: android-source/simple_live_app
+        run: flutter pub get
+      - name: Build release APK
+        working-directory: android-source/simple_live_app
+        run: flutter build apk --release
+      - name: Verify APK signature and contents
+        run: |
+          APK=android-source/simple_live_app/build/app/outputs/flutter-apk/app-release.apk
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK"
+          "$BUILD_TOOLS/aapt" dump badging "$APK" > apk-info.txt
+          cat apk-info.txt | head -12
+          sha256sum "$APK" > SHA256SUMS.txt
+          printf 'Source: https://github.com/xiaoyaocz/dart_simple_live\nCommit: ba828e6783b176ea5709fcd09f0eb01dfaceeb51\nLicense: GPL-3.0\nBuild: official Android source, personal signing key; Windows C# patches are not included.\n' > SOURCE.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SimpleLive-Android-APK
+          if-no-files-found: error
+          path: |
+            android-source/simple_live_app/build/app/outputs/flutter-apk/app-release.apk
+            android-source/LICENSE
+            SOURCE.txt
+            SHA256SUMS.txt
+            apk-info.txt
