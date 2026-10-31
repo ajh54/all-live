@@ -40,7 +40,15 @@ jobs:
             > android-source/simple_live_app/android/key.properties
       - name: Restore Flutter dependencies
         working-directory: android-source/simple_live_app
-        run: flutter pub get
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('pubspec.yaml')
+          text = path.read_text()
+          assert 'auto_orientation_v2: ^2.3.6' in text
+          path.write_text(text.replace('auto_orientation_v2: ^2.3.6', 'auto_orientation_v2: 2.3.6'))
+          PY
+          flutter pub get
       - name: Build release APK
         working-directory: android-source/simple_live_app
         run: flutter build apk --release
@@ -52,7 +60,7 @@ jobs:
           "$BUILD_TOOLS/aapt" dump badging "$APK" > apk-info.txt
           cat apk-info.txt | head -12
           sha256sum "$APK" > SHA256SUMS.txt
-          printf 'Source: https://github.com/xiaoyaocz/dart_simple_live\nCommit: ba828e6783b176ea5709fcd09f0eb01dfaceeb51\nLicense: GPL-3.0\nBuild: official Android source, personal signing key; Windows C# patches are not included.\n' > SOURCE.txt
+          printf 'Source: https://github.com/xiaoyaocz/dart_simple_live\nCommit: ba828e6783b176ea5709fcd09f0eb01dfaceeb51\nLicense: GPL-3.0\nBuild: official Android source, personal signing key; Windows C# patches are not included.\nDependency adjustment: auto_orientation_v2 pinned to 2.3.6.\n' > SOURCE.txt
       - uses: actions/upload-artifact@v4
         with:
           name: SimpleLive-Android-APK
@@ -63,3 +71,5 @@ jobs:
             SOURCE.txt
             SHA256SUMS.txt
             apk-info.txt
+            android-source/simple_live_app/pubspec.yaml
+            android-source/simple_live_app/pubspec.lock
