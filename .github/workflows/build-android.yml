@@ -44,7 +44,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import re
-          for path in [Path('pubspec.yaml'), Path('../simple_live_core/pubspec.yaml')]:
+          for path in [Path('pubspec.yaml')]:
               text = path.read_text()
               dependencies, marker, development = text.partition('dev_dependencies:')
               path.write_text(re.sub(r': \^(\d+\.\d+\.\d+[^\s#]*)', r': \1', dependencies) + marker + development)
