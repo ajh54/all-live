@@ -21,6 +21,7 @@ namespace AllLive.Core
 {
     public class Huya : ILiveSite
     {
+        public const string PlayUserAgent = "HYSDK(Windows, 30000002)_APP(pc_exe&7060000&official)_SDK(trans&2.32.3.5646)";
         public string Name => "虎牙直播";
         public ILiveDanmaku GetDanmaku() => new HuyaDanmaku();
         TupHttpHelper tupHttpHelper = new TupHttpHelper("http://wup.huya.com", "liveui");
@@ -162,12 +163,11 @@ namespace AllLive.Core
                     {
                         Line = flvUrl,
                         LineType = HuyaLineType.FLV,
-                        // 必须带上 cdn_type，否则 getCdnTokenInfo 只会签发默认 CDN 的
-                        // token，换到别的线路（尤其 al）播放就会 403
                         CdnType = GetCdnType(flvUrl),
                         FlvAntiCode = item["sFlvAntiCode"].ToString(),
                         HlsAntiCode = item["sHlsAntiCode"].ToString(),
                         StreamName = item["sStreamName"].ToString(),
+                        PresenterUid = topSid,
                     });
                 }
                 //HLS效果不好，暂不使用
@@ -251,7 +251,7 @@ namespace AllLive.Core
 
             return jsonObj;
         }
-        private long GetUuid()
+        private static long GetUuid()
         {
             return (long)((DateTimeOffset.Now.ToUnixTimeMilliseconds() % 10000000000 * 1000 + (1000 * new Random().Next(0, int.MaxValue))) % uint.MaxValue);
         }
@@ -459,17 +459,36 @@ namespace AllLive.Core
 
         private async Task<string> GetRealUrl(HuyaLineModel line, int bitrate)
         {
-            HYGetCdnTokenReq req = new HYGetCdnTokenReq();
-            req.stream_name = line.StreamName;
-            req.cdn_type = line.CdnType;
-
-            var resp = await tupHttpHelper.GetAsync(req, "getCdnTokenInfo", new HYGetCdnTokenResp());
-            var url =$"{line.Line}/{resp.stream_name}.flv?{resp.flv_anti_code}&codec=264";
+            var req = new HYGetCdnTokenExReq { StreamName = line.StreamName };
+            var resp = await tupHttpHelper.GetAsync(req, "getCdnTokenInfoEx", new HYGetCdnTokenExResp());
+            if (string.IsNullOrWhiteSpace(resp.FlvToken))
+                throw new InvalidOperationException("虎牙播放凭据获取失败，请稍后重试");
+            var antiCode = BuildAntiCode(line.StreamName, line.PresenterUid, resp.FlvToken);
+            var url = $"{line.Line}/{line.StreamName}.flv?{antiCode}&codec=264";
             if (bitrate > 0)
             {
                 url += $"&ratio={bitrate}";
             }
             return url;
+        }
+
+        // Adapted from xiaoyaocz/dart_simple_live's MIT-licensed Huya implementation.
+        public static string BuildAntiCode(string stream, long presenterUid, string antiCode)
+        {
+            var query = HttpUtility.ParseQueryString(antiCode);
+            if (string.IsNullOrEmpty(query["fm"])) return antiCode;
+            var ctype = query["ctype"] ?? "huya_pc_exe";
+            var platform = query["t"] ?? "0";
+            var seqId = presenterUid + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            // Rotate only the low 32 bits; retain the upper bits of the UID.
+            var low = (uint)presenterUid;
+            var rotated = (presenterUid & ~0xffffffffL) | (uint)((low << 8) | (low >> 24));
+            var uid = platform == "103" ? presenterUid : rotated;
+            var prefix = Encoding.UTF8.GetString(Convert.FromBase64String(Uri.UnescapeDataString(query["fm"]))).Split('_')[0];
+            var hash = Utils.ToMD5($"{seqId}|{ctype}|{platform}");
+            var secret = Utils.ToMD5($"{prefix}_{uid}_{stream}_{hash}_{query["wsTime"]}");
+            var result = $"wsSecret={secret}&wsTime={query["wsTime"]}&seqid={seqId}&ctype={Uri.EscapeDataString(ctype)}&ver=1&fs={query["fs"]}&fm={Uri.EscapeDataString(query["fm"])}&t={platform}";
+            return result + (platform == "103" ? $"&uid={uid}&uuid={GetUuid()}" : $"&u={uid}");
         }
 
         public async Task<bool> GetLiveStatus(object roomId)
@@ -497,6 +516,7 @@ namespace AllLive.Core
     }
     public class HuyaLineModel
     {
+        public long PresenterUid { get; set; }
         public string Line { get; set; }
         public string FlvAntiCode { get; set; }
         public string StreamName { get; set; }

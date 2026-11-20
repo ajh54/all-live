@@ -57,7 +57,8 @@ public class Player
     public const int MaxReplayCount = 3; public bool playbackStopped;
     public int SetCalls; public Task<bool> SetPlayer(string url) { SetCalls++; return Task.FromResult(true); }
     public Task<bool> Replay() => ReplayCurrentLineAsync();
-""" + Method(page, "ReplayCurrentLineAsync") + """
+    public void EndAfter(TimeSpan age) => UpdateReplayBudget(age);
+""" + Method(page, "ReplayCurrentLineAsync") + Method(page, "UpdateReplayBudget") + """
 }
 public static class Checks
 {
@@ -108,6 +109,10 @@ public static class Checks
         Check(!await p.Replay() && p.replayCount == 1 && p.SetCalls == 0, "failed fetch consumes bounded retry");
         p.replayCount = 3;
         Check(!await p.Replay() && p.replayCount == 3, "retry limit stops more requests");
+        p.EndAfter(TimeSpan.FromSeconds(8));
+        Check(p.replayCount == 3, "short streams cannot reset retry limit");
+        p.EndAfter(TimeSpan.FromMinutes(2));
+        Check(p.replayCount == 0, "long running stream can reconnect after later expiry");
         p = new Player { liveRoomVM = Ready() }; var replay = p.Replay(); p.playbackStopped = true;
         Check(await replay && p.SetCalls == 0, "leaving room cancels delayed playback");
         p = new Player { liveRoomVM = Ready() }; replay = p.Replay(); p.playbackVersion++;

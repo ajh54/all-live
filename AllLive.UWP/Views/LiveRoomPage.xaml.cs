@@ -59,6 +59,7 @@ namespace AllLive.UWP.Views
 
         /// <summary>连续重放同一线路的次数，避免「地址一直无效」时死循环</summary>
         private int replayCount;
+        private readonly Stopwatch openedStreamAge = new Stopwatch();
         private const int MaxReplayCount = 3;
         private bool recoveringPlayback;
         private bool playbackStopped;
@@ -261,8 +262,8 @@ namespace AllLive.UWP.Views
         {
             await this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
-                //播放成功，重置重放计数（地址失效时每次都能重新刷新）
-                replayCount = 0;
+                // 短片段也会触发 MediaOpened，不能在这里清空失败次数。
+                openedStreamAge.Restart();
                 //保持屏幕常亮
                 dispRequest.RequestActive();
                 PlayerLoading.Visibility = Visibility.Collapsed;
@@ -566,7 +567,7 @@ namespace AllLive.UWP.Views
                     //var last8 = sysTs % 100000000;
                     //var currentTs = last8 > validTs ? last8 : (validTs + sysTs / 100);
                     //config.FFmpegOptions.Add("user_agent", $"HYSDK(Windows, {currentTs})");
-                    config.FFmpegOptions.Add("user_agent", "HYSDK(Windows, 30000002)_APP(pc_exe&6080100&official)_SDK(trans&2.23.0.4969)");
+                    config.FFmpegOptions.Add("user_agent", AllLive.Core.Huya.PlayUserAgent);
                 }
                 try
                 {
@@ -599,6 +600,11 @@ namespace AllLive.UWP.Views
 
         }
 
+        private void UpdateReplayBudget(TimeSpan streamAge)
+        {
+            if (streamAge >= TimeSpan.FromMinutes(1)) replayCount = 0;
+        }
+
         private async void PlayError()
         {
             if (recoveringPlayback || playbackStopped || liveRoomVM.CurrentLine == null)
@@ -606,6 +612,8 @@ namespace AllLive.UWP.Views
                 return;
             }
             recoveringPlayback = true;
+            UpdateReplayBudget(openedStreamAge.Elapsed);
+            openedStreamAge.Reset();
             try
             {
                 while (replayCount < MaxReplayCount)
