@@ -72,7 +72,7 @@ namespace AllLive.Core
             }
             renderData = renderData.Trim().Replace("\\\"", "\"").Replace("\\\\", "\\").Replace("]\\n", "");
             // 解析JSON数据
-            var renderDataJson = JObject.Parse(renderData);
+            var renderDataJson = ReadEmbeddedObject(renderData);
             foreach (var item in renderDataJson["categoryData"])
             {
                 List<LiveSubCategory> subs = new List<LiveSubCategory>();
@@ -445,7 +445,7 @@ namespace AllLive.Core
                 throw new Exception("无法读取直播间数据");
             }
             json = json.Trim().Replace("\\\"", "\"").Replace("\\\\", "\\").Replace("]\\n", "");
-            return JObject.Parse(json)["state"];
+            return ReadEmbeddedObject(json)["state"];
         }
 
         private async Task<JToken> GetRoomDataApi(string webRid)
@@ -641,7 +641,7 @@ namespace AllLive.Core
                 { "sec-fetch-site", "same-origin" },
                 { "user-agent", USER_AGENT }
             };
-            var resp = await HttpUtil.GetString(requestUrl, headers);
+            var resp = await HttpUtil.GetString(await GetABougs(requestUrl), headers);
             var json = JObject.Parse(resp);
             var items = new List<LiveRoomItem>();
             foreach (var item in json["data"])
@@ -692,26 +692,17 @@ namespace AllLive.Core
             return sb.ToString();
         }
 
-        private async Task<string> GetABougs(string url)
+        private static JObject ReadEmbeddedObject(string text)
         {
-            try
-            {
-                var resp = await HttpUtil.PostJsonString("https://dy.nsapps.cn/abogus",
-                   JsonConvert.SerializeObject(new
-                   {
-                       url,
-                       userAgent = USER_AGENT
-                   }
-               ));
-                var obj = JObject.Parse(resp);
-                return obj["data"]["url"].ToString();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex.Message);
-                return url;
-            }
+            // React flight data may append array terminators after the object.
+            // Read exactly one JSON object rather than treating those as JSON content.
+            using (var reader = new JsonTextReader(new System.IO.StringReader(text)))
+                return JObject.Load(reader);
+        }
 
+        private Task<string> GetABougs(string url)
+        {
+            return Task.FromResult(DouyinSignature.SignUrl(url, USER_AGENT));
         }
     }
 }

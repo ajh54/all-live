@@ -1,0 +1,35 @@
+using AllLive.Core;
+using AllLive.Core.Helper;
+var ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0";
+var signed = DouyinSignature.SignUrl("https://live.douyin.com/test?aid=6383&a_bogus=0&msToken=old", ua);
+if (signed.Split("a_bogus=").Length != 2 || signed.Split("msToken=").Length != 2 || signed.Contains("msToken=old")) throw new Exception("Invalid signing query");
+Console.WriteLine("Signing checks passed");
+var parse = typeof(Douyin).GetMethod("ReadEmbeddedObject", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+var embedded = (Newtonsoft.Json.Linq.JObject)parse.Invoke(null, new object[] { "{\"categoryData\":[{\"name\":\"quoted \\\"name\\\"\"}]}]]" })!;
+if (embedded["categoryData"]?.Count() != 1) throw new Exception("Embedded JSON parser regression");
+Console.WriteLine("Embedded category parsing checks passed");
+if (!args.Contains("--live")) return;
+var site = new Douyin();
+try {
+    var list = await site.GetRecommendRooms();
+    Console.WriteLine("Recommended rooms: " + list.Rooms.Count);
+    var room = await site.GetRoomDetail(list.Rooms.First().RoomID);
+    Console.WriteLine("Room live: " + room.Status);
+    var qualities = await site.GetPlayQuality(room);
+    Console.WriteLine("Qualities: " + qualities.Count);
+    var urls = await site.GetPlayUrls(room, qualities.Last());
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+    http.DefaultRequestHeaders.UserAgent.ParseAdd(ua);
+    http.DefaultRequestHeaders.Referrer = new Uri("https://live.douyin.com/");
+    using var response = await http.GetAsync(urls.First(), HttpCompletionOption.ResponseHeadersRead);
+    response.EnsureSuccessStatusCode();
+    using var stream = await response.Content.ReadAsStreamAsync();
+    var buffer = new byte[1024];
+    var read = await stream.ReadAsync(buffer);
+    if (read == 0) throw new Exception("Empty live stream");
+    Console.WriteLine("Live stream HTTP " + (int)response.StatusCode + "; first bytes " + Convert.ToHexString(buffer.AsSpan(0, Math.Min(read, 8))));
+    var categories = await site.GetCategores();
+    Console.WriteLine("Categories: " + categories.Count);
+    var categoryRooms = await site.GetCategoryRooms(categories.First().Children.First());
+    Console.WriteLine("Category rooms: " + categoryRooms.Rooms.Count);
+} catch(Exception e) { Console.WriteLine(e.ToString()); Environment.ExitCode = 1; }
