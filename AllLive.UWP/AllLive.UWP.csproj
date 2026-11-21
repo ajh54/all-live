@@ -155,6 +155,7 @@
     <Compile Include="Helper\MessageCenter.cs" />
     <Compile Include="Helper\SettingHelper.cs" />
     <Compile Include="Helper\Utils.cs" />
+    <Compile Include="Helper\TwitchPlaybackSource.cs" />
     <Compile Include="MainPage.xaml.cs">
       <DependentUpon>MainPage.xaml</DependentUpon>
     </Compile>

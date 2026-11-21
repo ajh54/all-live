@@ -48,6 +48,7 @@ namespace AllLive.UWP.Views
         readonly SettingVM settingVM;
 
         FFmpegInteropX.FFmpegMediaSource interopMSS;
+        TwitchPlaybackSource twitchSource;
         readonly MediaPlayer mediaPlayer;
 
         DisplayRequest dispRequest;
@@ -61,6 +62,7 @@ namespace AllLive.UWP.Views
         private int replayCount;
         private readonly Stopwatch openedStreamAge = new Stopwatch();
         private readonly Stopwatch bufferingAge = new Stopwatch();
+        private int twitchDiagnosticTicks;
         private const int MaxReplayCount = 3;
         private bool recoveringPlayback;
         private bool playbackStopped;
@@ -271,8 +273,8 @@ namespace AllLive.UWP.Views
             {
                 // 短片段也会触发 MediaOpened，不能在这里清空失败次数。
                 openedStreamAge.Restart();
-                if (liveRoomVM.SiteName == "Twitch" && interopMSS?.CurrentVideoStream != null)
-                    LogHelper.Log($"Twitch 播放已打开，画质 {liveRoomVM.CurrentQuality?.Quality}，解码器 {interopMSS.CurrentVideoStream.DecoderEngine}，预读缓存已开启", LogType.INFO);
+                if (twitchSource != null)
+                    LogHelper.Log($"Twitch 原生 HLS 播放已打开，画质 {liveRoomVM.CurrentQuality?.Quality}，音轨 {(mediaPlayer.Source as MediaPlaybackItem)?.AudioTracks.Count}", LogType.INFO);
                 //保持屏幕常亮
                 dispRequest.RequestActive();
                 PlayerLoading.Visibility = Visibility.Collapsed;
@@ -319,6 +321,11 @@ namespace AllLive.UWP.Views
         {
             try
             {
+                if (twitchSource != null)
+                {
+                    txtInfo.Text = $"Quality: {liveRoomVM.CurrentQuality?.Quality}\r\nPlayback Engine: Windows Native HLS\r\nResolution: {mediaPlayer.PlaybackSession.NaturalVideoWidth} x {mediaPlayer.PlaybackSession.NaturalVideoHeight}";
+                    return;
+                }
 
                 var str = $"Url: {liveRoomVM.CurrentLine?.Url ?? ""}\r\n";
                 str += $"Quality: {liveRoomVM.CurrentQuality?.Quality ?? ""}\r\n";
@@ -544,6 +551,23 @@ namespace AllLive.UWP.Views
                     interopMSS.Dispose();
                     interopMSS = null;
                 }
+                twitchSource?.Dispose();
+                twitchSource = null;
+                if (liveRoomVM.SiteName == "Twitch")
+                {
+                    var native = await TwitchPlaybackSource.CreateAsync(url, message => LogHelper.Log(message, LogType.ERROR));
+                    if (playbackStopped || version != playbackVersion)
+                    {
+                        native.Dispose();
+                        return false;
+                    }
+                    twitchSource = native;
+                    mediaPlayer.AutoPlay = true;
+                    mediaPlayer.Volume = SliderVolume.Value;
+                    mediaPlayer.Source = new Windows.Media.Playback.MediaPlaybackItem(native.Source);
+                    player.SetMediaPlayer(mediaPlayer);
+                    return true;
+                }
 
                 var config = new MediaSourceConfig();
                 config.FFmpegOptions.Add("rtsp_transport", "tcp");
@@ -559,27 +583,6 @@ namespace AllLive.UWP.Views
                     default:
                         config.Video.VideoDecoderMode = VideoDecoderMode.Automatic;
                         break;
-                }
-                if (liveRoomVM.SiteName == "Twitch")
-                {
-                    // Prefer the Windows presentation/decoder path for 60 fps HLS.
-                    // Keep explicit user decoder choices and retain automatic fallback.
-                    if (decoder == 0)
-                    {
-                        config.Video.VideoDecoderMode = VideoDecoderMode.AutomaticSystemDecoder;
-                        config.Video.SystemDecoderH264MaxLevel = 42;
-                    }
-                    // Read HLS segments ahead instead of fetching on decoder demand.
-                    // Allow several segments of headroom for cross-border jitter.
-                    config.General.ReadAheadBufferEnabled = true;
-                    config.General.ReadAheadBufferDuration = TimeSpan.FromSeconds(20);
-                    config.General.ReadAheadBufferSize = 32 * 1024 * 1024;
-                    config.FFmpegOptions.Add("live_start_index", -6);
-                    config.FFmpegOptions.Add("user_agent", AllLive.Core.Twitch.UserAgent);
-                    var proxy = await Windows.Networking.Connectivity.NetworkInformation.GetProxyConfigurationAsync(new Uri(url));
-                    var proxyUri = proxy.ProxyUris.FirstOrDefault();
-                    if (proxyUri != null && (proxyUri.Scheme == "http" || proxyUri.Scheme == "https"))
-                        config.FFmpegOptions.Add("http_proxy", proxyUri.AbsoluteUri);
                 }
                 if (liveRoomVM.SiteName == "哔哩哔哩直播")
                 {
@@ -690,6 +693,8 @@ namespace AllLive.UWP.Views
                 interopMSS.Dispose();
                 interopMSS = null;
             }
+            twitchSource?.Dispose();
+            twitchSource = null;
 
             timer_focus.Stop();
             controlTimer.Stop();
@@ -715,6 +720,11 @@ namespace AllLive.UWP.Views
         }
         private void ControlTimer_Tick(object sender, object e)
         {
+            if (twitchSource != null && ++twitchDiagnosticTicks >= 15)
+            {
+                twitchDiagnosticTicks = 0;
+                LogHelper.Log($"Twitch 原生 HLS 状态 {mediaPlayer.PlaybackSession.PlaybackState}，播放位置 {mediaPlayer.PlaybackSession.Position.TotalSeconds:F1} 秒", LogType.INFO);
+            }
             if (showControlsFlag != -1)
             {
                 if (showControlsFlag >= 5)
@@ -1508,6 +1518,8 @@ namespace AllLive.UWP.Views
                 interopMSS.Dispose();
                 interopMSS = null;
             }
+            twitchSource?.Dispose();
+            twitchSource = null;
 
             liveRoomVM?.Stop();
             liveRoomVM.LoadData(pageArgs.Site, liveRoomVM.RoomID);
