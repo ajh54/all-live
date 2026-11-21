@@ -60,6 +60,7 @@ namespace AllLive.UWP.Views
         /// <summary>连续重放同一线路的次数，避免「地址一直无效」时死循环</summary>
         private int replayCount;
         private readonly Stopwatch openedStreamAge = new Stopwatch();
+        private readonly Stopwatch bufferingAge = new Stopwatch();
         private const int MaxReplayCount = 3;
         private bool recoveringPlayback;
         private bool playbackStopped;
@@ -225,6 +226,9 @@ namespace AllLive.UWP.Views
         {
             await this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
+                if (liveRoomVM.SiteName == "Twitch" && bufferingAge.IsRunning)
+                    LogHelper.Log($"Twitch 缓冲结束，耗时 {bufferingAge.Elapsed.TotalSeconds:F1} 秒", LogType.INFO);
+                bufferingAge.Reset();
                 PlayerLoading.Visibility = Visibility.Collapsed;
             });
 
@@ -242,6 +246,9 @@ namespace AllLive.UWP.Views
         {
             await this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
+                bufferingAge.Restart();
+                if (liveRoomVM.SiteName == "Twitch")
+                    LogHelper.Log($"Twitch 开始缓冲，画质 {liveRoomVM.CurrentQuality?.Quality}", LogType.INFO);
                 PlayerLoading.Visibility = Visibility.Visible;
                 PlayerLoadText.Text = "缓冲中";
             });
@@ -264,6 +271,8 @@ namespace AllLive.UWP.Views
             {
                 // 短片段也会触发 MediaOpened，不能在这里清空失败次数。
                 openedStreamAge.Restart();
+                if (liveRoomVM.SiteName == "Twitch" && interopMSS?.CurrentVideoStream != null)
+                    LogHelper.Log($"Twitch 播放已打开，画质 {liveRoomVM.CurrentQuality?.Quality}，解码器 {interopMSS.CurrentVideoStream.DecoderEngine}，预读缓存已开启", LogType.INFO);
                 //保持屏幕常亮
                 dispRequest.RequestActive();
                 PlayerLoading.Visibility = Visibility.Collapsed;
@@ -553,6 +562,12 @@ namespace AllLive.UWP.Views
                 }
                 if (liveRoomVM.SiteName == "Twitch")
                 {
+                    // Read HLS segments ahead instead of fetching on decoder demand.
+                    // Allow several segments of headroom for cross-border jitter.
+                    config.General.ReadAheadBufferEnabled = true;
+                    config.General.ReadAheadBufferDuration = TimeSpan.FromSeconds(20);
+                    config.General.ReadAheadBufferSize = 32 * 1024 * 1024;
+                    config.FFmpegOptions.Add("live_start_index", -6);
                     config.FFmpegOptions.Add("user_agent", AllLive.Core.Twitch.UserAgent);
                     var proxy = await Windows.Networking.Connectivity.NetworkInformation.GetProxyConfigurationAsync(new Uri(url));
                     var proxyUri = proxy.ProxyUris.FirstOrDefault();
