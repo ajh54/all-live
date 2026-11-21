@@ -240,7 +240,8 @@ namespace AllLive.UWP.Views
         {
             await this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
-                PlayerLoadText.Text = sender.BufferingProgress.ToString("p");
+                // Native adaptive playback does not consistently expose BufferingProgress.
+                PlayerLoadText.Text = twitchSource != null ? "缓冲中" : sender.BufferingProgress.ToString("p");
             });
         }
 
