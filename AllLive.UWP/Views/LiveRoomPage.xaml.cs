@@ -562,6 +562,13 @@ namespace AllLive.UWP.Views
                 }
                 if (liveRoomVM.SiteName == "Twitch")
                 {
+                    // Prefer the Windows presentation/decoder path for 60 fps HLS.
+                    // Keep explicit user decoder choices and retain automatic fallback.
+                    if (decoder == 0)
+                    {
+                        config.Video.VideoDecoderMode = VideoDecoderMode.AutomaticSystemDecoder;
+                        config.Video.SystemDecoderH264MaxLevel = 42;
+                    }
                     // Read HLS segments ahead instead of fetching on decoder demand.
                     // Allow several segments of headroom for cross-border jitter.
                     config.General.ReadAheadBufferEnabled = true;
