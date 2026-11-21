@@ -226,6 +226,7 @@
     <Content Include="Assets\Logo\egame.png" />
     <Content Include="Assets\Logo\huya.png" />
     <Content Include="Assets\Logo\douyu.png" />
+    <Content Include="Assets\Logo\twitch.png" />
     <Content Include="Assets\Placeholder\Placeholder.png" />
     <Content Include="Assets\Placeholder\Placeholder1x1.png" />
     <Content Include="Assets\SmallTile.scale-100.png" />

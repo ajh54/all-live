@@ -17,6 +17,7 @@ namespace AllLive.UWP.Helper
         Douyu=1,
         Huya=2,
         Douyin=3,
+        Twitch=4,
         Unknown=99,
     }
     public class SiteParser
@@ -26,6 +27,12 @@ namespace AllLive.UWP.Helper
         {
             LiveSite site= LiveSite.Unknown;
             var roomId = "";
+            if (Uri.TryCreate(url.Trim(), UriKind.Absolute, out var twitchUri) &&
+                (twitchUri.Host == "twitch.tv" || twitchUri.Host.EndsWith(".twitch.tv", StringComparison.OrdinalIgnoreCase)))
+            {
+                try { return (LiveSite.Twitch, AllLive.Core.Twitch.NormalizeChannel(url)); }
+                catch (ArgumentException) { return (LiveSite.Unknown, ""); }
+            }
             if (url.Contains("bilibili.com"))
             {
                 roomId = url.MatchText(@"bilibili\.com/([\d|\w]+)", "");

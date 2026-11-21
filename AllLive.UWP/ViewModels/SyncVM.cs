@@ -352,6 +352,9 @@ namespace AllLive.UWP.ViewModels
                     case "虎牙直播":
                         siteId = "huya";
                         break;
+                    case "Twitch":
+                        siteId = "twitch";
+                        break;
                     case "抖音直播":
                         siteId = "douyin";
                         break;
@@ -408,6 +411,9 @@ namespace AllLive.UWP.ViewModels
                         break;
                     case "虎牙直播":
                         siteId = "huya";
+                        break;
+                    case "Twitch":
+                        siteId = "twitch";
                         break;
                     case "抖音直播":
                         siteId = "douyin";
@@ -569,6 +575,7 @@ namespace AllLive.UWP.ViewModels
                         return "斗鱼直播";
                     case "huya":
                         return "虎牙直播";
+                    case "twitch": return "Twitch";
                     case "douyin":
                         return "抖音直播";
                     default:

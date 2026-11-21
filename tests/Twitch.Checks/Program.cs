@@ -1,0 +1,41 @@
+using AllLive.Core;
+using AllLive.Core.Danmaku;
+using AllLive.UWP.Helper;
+void Check(bool ok, string name) { if (!ok) throw new Exception(name); Console.WriteLine("PASS " + name); }
+Check(Twitch.NormalizeChannel("https://www.twitch.tv/Example_Name?ref=test") == "example_name", "normalize channel link");
+foreach(var input in new[] { "https://eviltwitch.tv/name", "name\r\nJOIN #other", "https://twitch.tv/videos/123" }) {
+    bool rejected=false; try { Twitch.NormalizeChannel(input); } catch(ArgumentException) { rejected=true; } Check(rejected,"reject invalid channel");
+}
+var parsed = await SiteParser.ParseUrl("https://www.twitch.tv/example_name");
+Check(parsed.Item1==LiveSite.Twitch && parsed.Item2=="example_name", "link opens Twitch platform");
+var playlist="#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,FRAME-RATE=60.000,VIDEO=\"chunked\"\nsource.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=100000,VIDEO=\"audio_only\"\nhttps://example.org/audio.m3u8\n";
+var variants=Twitch.ParsePlaylist(playlist,new Uri("https://example.org/live/master.m3u8"));
+Check(variants.Count==2 && variants[0].Quality=="1080p60（原画）" && (string)variants[0].Data=="https://example.org/live/source.m3u8", "HLS quality and relative URI");
+Check(variants[1].Quality=="仅音频", "audio-only quality");
+var msg=TwitchDanmaku.ParseMessage("@display-name=Hello\\sWorld;other=tag :hello!hello@hello.tmi.twitch.tv PRIVMSG #room :你好 Twitch");
+Check(msg?.UserName=="Hello World" && msg.Message=="你好 Twitch", "IRC tags and Unicode message");
+Check(TwitchDanmaku.ParseMessage("PING :tmi.twitch.tv")==null,"IRC control line excluded");
+if(!args.Contains("--live")) return;
+var site=new Twitch();
+var recommended=await site.GetRecommendRooms(); Check(recommended.Rooms.Count>0,"live recommendations");
+var next=await site.GetRecommendRooms(2); Check(!recommended.HasMore && next.Rooms.Count==0,"anonymous directory stops before protected pagination");
+var categories=await site.GetCategores(); Check(categories[0].Children.Count>0,"live categories");
+var category=await site.GetCategoryRooms(categories[0].Children[0]); Check(category.Rooms.Count>0,"category live rooms");
+var channel=recommended.Rooms[0].RoomID;
+var search=await site.Search(channel); Check(search.Rooms.Any(r=>r.RoomID==channel),"channel search");
+var room=await site.GetRoomDetail(channel); Check(room.Status,"live room detail");
+var qualities=await site.GetPlayQuality(room); Check(qualities.Count>0,"playback token and HLS qualities");
+Console.WriteLine("Channel: "+channel+"; qualities: "+string.Join(", ",qualities.Select(q=>q.Quality)));
+using var http=new HttpClient { Timeout=TimeSpan.FromSeconds(25) };
+http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",Twitch.UserAgent);
+var url=(await site.GetPlayUrls(room,qualities.First()))[0];
+var media=await http.GetStringAsync(url); Check(media.Contains("#EXTINF"),"live media playlist");
+var segment=media.Split('\n').Select(s=>s.Trim()).First(s=>s.Length>0&&!s.StartsWith("#"));
+using var response=await http.GetAsync(new Uri(new Uri(url),segment),HttpCompletionOption.ResponseHeadersRead);
+response.EnsureSuccessStatusCode(); using var stream=await response.Content.ReadAsStreamAsync();
+var buffer=new byte[65536]; var count=await stream.ReadAsync(buffer); Check(count>0,"video segment bytes");
+var danmaku=site.GetDanmaku(); int messages=0; var gotMessage=new TaskCompletionSource<bool>();
+danmaku.NewMessage+=(_,_)=>{Interlocked.Increment(ref messages);gotMessage.TrySetResult(true);};
+danmaku.OnClose+=(_,e)=>Console.WriteLine(e);
+await danmaku.Start(channel); await Task.WhenAny(gotMessage.Task,Task.Delay(25000)); await danmaku.Stop();
+Check(messages>0,"anonymous read-only live chat");

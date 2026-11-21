@@ -551,6 +551,14 @@ namespace AllLive.UWP.Views
                         config.Video.VideoDecoderMode = VideoDecoderMode.Automatic;
                         break;
                 }
+                if (liveRoomVM.SiteName == "Twitch")
+                {
+                    config.FFmpegOptions.Add("user_agent", AllLive.Core.Twitch.UserAgent);
+                    var proxy = await Windows.Networking.Connectivity.NetworkInformation.GetProxyConfigurationAsync(new Uri(url));
+                    var proxyUri = proxy.ProxyUris.FirstOrDefault();
+                    if (proxyUri != null && (proxyUri.Scheme == "http" || proxyUri.Scheme == "https"))
+                        config.FFmpegOptions.Add("http_proxy", proxyUri.AbsoluteUri);
+                }
                 if (liveRoomVM.SiteName == "哔哩哔哩直播")
                 {
                     config.FFmpegOptions.Add("user_agent", "Mozilla/5.0 BiliDroid/1.12.0 (bbcallen@gmail.com)");

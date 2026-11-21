@@ -40,6 +40,13 @@ namespace AllLive.UWP.ViewModels
                 Logo="ms-appx:///Assets/Logo/douyin.png",
                 LiveSite=new AllLive.Core.Douyin(),
             },
+            new Site()
+            {
+                SiteType=LiveSite.Twitch,
+                Name="Twitch",
+                Logo="ms-appx:///Assets/Logo/twitch.png",
+                LiveSite=new AllLive.Core.Twitch(),
+            },
         };
 
     }
